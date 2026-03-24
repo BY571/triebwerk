@@ -125,6 +125,7 @@ def save_run_config(args, grpo_config, model_info, output_path):
             "double_quant": True,
             "lora_rank": args.lora_rank,
             "lora_alpha": args.lora_rank,
+            "max_seq_length": args.max_seq_length,
             "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
                                      "gate_proj", "up_proj", "down_proj"],
             "trainable_params": model_info["trainable"],
@@ -157,6 +158,8 @@ def save_run_config(args, grpo_config, model_info, output_path):
         "tutorial_defaults_diff": {
             "use_vllm": "tutorial=True, jetson=False (ARM)",
             "num_generations": f"tutorial=8, jetson={args.num_generations} (memory)",
+            "max_completion_tokens": f"tutorial=1024, jetson={args.max_completion_tokens}",
+            "max_seq_length": f"tutorial=1024, jetson={args.max_seq_length}",
             "model": f"tutorial=Qwen2.5-3B, jetson={args.model} (8GB)",
             "lora_rank": f"tutorial=32, jetson={args.lora_rank}",
         },
@@ -204,8 +207,10 @@ def main():
                         help="Training steps (unsloth tutorial recommends 300 minimum)")
     parser.add_argument("--num-generations", type=int, default=4,
                         help="Completions per prompt (tutorial uses 8, reduced for 8GB)")
-    parser.add_argument("--max-completion-tokens", type=int, default=512,
-                        help="Max tokens per completion (tutorial uses 1024)")
+    parser.add_argument("--max-completion-tokens", type=int, default=1024,
+                        help="Max new tokens per completion (matches tutorial max_seq_length)")
+    parser.add_argument("--max-seq-length", type=int, default=2048,
+                        help="Max total sequence length (prompt+completion). Limits KV cache allocation.")
     parser.add_argument("--lr", type=float, default=5e-6,
                         help="Learning rate (matches tutorial)")
     parser.add_argument("--lora-rank", type=int, default=32,
@@ -236,8 +241,10 @@ def main():
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.float16,
+        max_length=args.max_seq_length,  # limit KV cache allocation
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.model_max_length = args.max_seq_length
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -297,7 +304,7 @@ def main():
     )
 
     print(f"\nConfig:")
-    print(f"  steps={args.max_steps}, G={G}, max_tokens={args.max_completion_tokens}")
+    print(f"  steps={args.max_steps}, G={G}, max_tokens={args.max_completion_tokens}, max_seq={args.max_seq_length}")
     print(f"  LR={args.lr}, beta=0.0, loss=dapo, scale_rewards=False")
     print(f"  lora_rank={args.lora_rank}, gradient_checkpointing=True")
     print(f"  fp16=True, bf16=False (Jetson compat)")
