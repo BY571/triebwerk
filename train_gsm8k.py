@@ -241,7 +241,6 @@ def main():
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.float16,
-        max_length=args.max_seq_length,  # limit KV cache allocation
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.model_max_length = args.max_seq_length
@@ -324,9 +323,9 @@ def main():
     metrics_logger = MetricsLogger(f"{run_dir}/metrics.json")
     original_log = trainer.log
 
-    def patched_log(logs):
+    def patched_log(logs, *a, **kw):
         metrics_logger.on_log(trainer.state.global_step, logs)
-        return original_log(logs)
+        return original_log(logs, *a, **kw)
 
     trainer.log = patched_log
 
