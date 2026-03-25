@@ -1,0 +1,24 @@
+{
+  "generation": {
+    "avg_per_completion_s": 78.03627628087997,
+    "avg_tokens_per_completion": 328.25,
+    "avg_ms_per_token": 237.756220631979,
+    "tok_per_s": 4.2059887953379445,
+    "total_time_s": 936.4353153705597,
+    "total_tokens": 3939,
+    "peak_memory_mb": 1000.282624
+  },
+  "backward": {
+    "forward_ms": 421.24390602111816,
+    "backward_ms": 385.34069061279297,
+    "optimizer_ms": 159.06524658203125,
+    "peak_memory_mb": 1443.616256
+  },
+  "step_estimate": {
+    "generation_s": 312.1451051235199,
+    "backward_s": 3.8625993728637695,
+    "total_s": 316.00770449638367,
+    "generation_pct": 98.77768822788055,
+    "speedup_if_gen_instant": 81.81218759482489
+  }
+}
