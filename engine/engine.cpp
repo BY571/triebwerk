@@ -272,9 +272,25 @@ void InferenceEngine::decode(int token_id) {
     launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // LM head (tied to embedding)
-    launch_lm_head(weights_.embed_tokens, norm_out, state_.logits,
-                   HIDDEN_SIZE, VOCAB_SIZE, stream);
+    // LM head (tied to embedding) -> fp32 logits via cuBLAS mixed precision
+    {
+        ensure_cublas();
+        float alpha = 1.0f, beta = 0.0f;
+        // embed_tokens is (VOCAB_SIZE, HIDDEN_SIZE) row-major
+        // We want logits[i] = embed[i,:] @ norm_out for all i
+        // = embed @ norm_out where embed is (VOCAB, HIDDEN) and norm_out is (HIDDEN, 1)
+        // cuBLAS col-major: embed^T is (HIDDEN, VOCAB), so CUBLAS_OP_T
+        cublasGemmEx(cublas_handle,
+                     CUBLAS_OP_T, CUBLAS_OP_N,
+                     VOCAB_SIZE, 1, HIDDEN_SIZE,
+                     &alpha,
+                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
+                     norm_out, CUDA_R_16F, HIDDEN_SIZE,
+                     &beta,
+                     state_.logits, CUDA_R_32F, VOCAB_SIZE,
+                     CUDA_R_32F,  // compute in fp32
+                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
 
     state_.current_pos++;
 }
