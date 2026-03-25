@@ -12,6 +12,12 @@
 #include <cstring>
 #include <random>
 
+// Helper to avoid void** casts everywhere
+template<typename T>
+inline cudaError_t cudaMallocTyped(T** ptr, size_t size) {
+    return cudaMalloc(reinterpret_cast<void**>(ptr), size);
+}
+
 // Forward declarations for kernel launchers (defined in kernels.cu)
 extern "C" {
     void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
@@ -36,26 +42,26 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
 
     // Allocate KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMalloc(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
-        cudaMalloc(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
+        cudaMallocTyped(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
+        cudaMallocTyped(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
     }
 
     // Allocate scratch buffers
-    cudaMalloc(&state_.hidden, HIDDEN_SIZE * sizeof(half));
-    cudaMalloc(&state_.residual, HIDDEN_SIZE * sizeof(half));
-    cudaMalloc(&state_.q_buf, Q_DIM * sizeof(half));
-    cudaMalloc(&state_.k_buf, KV_DIM * sizeof(half));
-    cudaMalloc(&state_.v_buf, KV_DIM * sizeof(half));
-    cudaMalloc(&state_.attn_out, Q_DIM * sizeof(half));
-    cudaMalloc(&state_.gate_buf, INTERMEDIATE_SIZE * sizeof(half));
-    cudaMalloc(&state_.up_buf, INTERMEDIATE_SIZE * sizeof(half));
-    cudaMalloc(&state_.ffn_out, HIDDEN_SIZE * sizeof(half));
-    cudaMalloc(&state_.logits, VOCAB_SIZE * sizeof(float));
-    cudaMalloc(&state_.attn_scores, NUM_HEADS * max_seq_len * sizeof(float));
+    cudaMallocTyped(&state_.hidden, HIDDEN_SIZE * sizeof(half));
+    cudaMallocTyped(&state_.residual, HIDDEN_SIZE * sizeof(half));
+    cudaMallocTyped(&state_.q_buf, Q_DIM * sizeof(half));
+    cudaMallocTyped(&state_.k_buf, KV_DIM * sizeof(half));
+    cudaMallocTyped(&state_.v_buf, KV_DIM * sizeof(half));
+    cudaMallocTyped(&state_.attn_out, Q_DIM * sizeof(half));
+    cudaMallocTyped(&state_.gate_buf, INTERMEDIATE_SIZE * sizeof(half));
+    cudaMallocTyped(&state_.up_buf, INTERMEDIATE_SIZE * sizeof(half));
+    cudaMallocTyped(&state_.ffn_out, HIDDEN_SIZE * sizeof(half));
+    cudaMallocTyped(&state_.logits, VOCAB_SIZE * sizeof(float));
+    cudaMallocTyped(&state_.attn_scores, NUM_HEADS * max_seq_len * sizeof(float));
 
     // Allocate and precompute RoPE tables
-    cudaMalloc(&state_.rope_cos, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
-    cudaMalloc(&state_.rope_sin, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
+    cudaMallocTyped(&state_.rope_cos, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
+    cudaMallocTyped(&state_.rope_sin, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
     precompute_rope();
 
     // Zero-init weights

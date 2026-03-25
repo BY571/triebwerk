@@ -75,7 +75,7 @@ static std::unordered_map<std::string, TensorInfo> parse_index(const char* json,
 // Allocate GPU memory and copy a tensor from the binary data
 static half* load_fp16_tensor(const char* data_start, const TensorInfo& info) {
     half* gpu_ptr;
-    cudaMalloc(&gpu_ptr, info.nbytes);
+    cudaMalloc(reinterpret_cast<void**>(&gpu_ptr), info.nbytes);
     cudaMemcpy(gpu_ptr, data_start + info.offset, info.nbytes, cudaMemcpyHostToDevice);
     return gpu_ptr;
 }

@@ -22,15 +22,21 @@ if (NOT pybind11_FOUND)
     FetchContent_MakeAvailable(pybind11)
 endif()
 
+# Find CUDA toolkit include dir
+find_package(CUDAToolkit REQUIRED)
+
 # Build the CUDA kernels as a static library
 add_library(kernels STATIC kernels.cu)
-target_include_directories(kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-set_target_properties(kernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+target_include_directories(kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+set_target_properties(kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+)
 
 # Build the Python module
 pybind11_add_module(jetson_engine engine_py.cpp engine.cpp weights.cpp)
-target_link_libraries(jetson_engine PRIVATE kernels)
-target_include_directories(jetson_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(jetson_engine PRIVATE kernels CUDA::cudart)
+target_include_directories(jetson_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
 
 # Install to workspace for easy import
 install(TARGETS jetson_engine LIBRARY DESTINATION ${CMAKE_INSTALL_PREFIX})
