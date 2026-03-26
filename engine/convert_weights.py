@@ -23,6 +23,43 @@ import safetensors.torch as st
 from huggingface_hub import snapshot_download
 
 
+NF4_TABLE = np.array([
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+], dtype=np.float32)
+
+
+def quantize_fp16_to_nf4(weight_fp16, block_size=64):
+    """Quantize fp16 weight matrix to NF4 format.
+    Returns (packed_uint8, absmax_float32, quant_map_float32)."""
+    w = weight_fp16.astype(np.float32).flatten()
+    n = len(w)
+    assert n % block_size == 0, f"Weight size {n} not divisible by block_size {block_size}"
+    n_blocks = n // block_size
+
+    # Compute per-block absmax
+    blocks = w.reshape(n_blocks, block_size)
+    absmax = np.max(np.abs(blocks), axis=1).astype(np.float32)
+    absmax = np.maximum(absmax, 1e-10)  # avoid division by zero
+
+    # Normalize and find nearest NF4 level
+    normalized = blocks / absmax[:, None]  # range [-1, 1]
+    # For each element, find the NF4 index that minimizes |normalized - NF4_TABLE[idx]|
+    # Broadcast: (n_blocks, block_size, 1) vs (1, 1, 16)
+    diffs = np.abs(normalized[:, :, None] - NF4_TABLE[None, None, :])
+    indices = np.argmin(diffs, axis=2).astype(np.uint8)  # (n_blocks, block_size)
+
+    # Pack pairs into bytes: hi nibble first
+    flat_indices = indices.flatten()
+    n_bytes = n // 2
+    packed = np.zeros(n_bytes, dtype=np.uint8)
+    packed = (flat_indices[0::2] << 4) | flat_indices[1::2]
+
+    return packed, absmax, NF4_TABLE.copy()
+
+
 def convert_nf4(args):
     """Save NF4 MLP weights as-is, dequant absmax to float32, attention as fp16."""
     print(f"Converting {args.model} (NF4 mode)...")
@@ -115,6 +152,28 @@ def convert_nf4(args):
             lines.append(f"{name} {offset} {len(data)} {dtype} {shape}")
             f.write(data)
             offset += len(data)
+
+    # Quantize embed_tokens to NF4 for LM head (saves 220MB, same speed)
+    embed_key = "embed_tokens.weight"
+    if embed_key in tensors:
+        embed = tensors[embed_key]
+        embed_fp16 = embed.to(torch.float16) if embed.dtype == torch.bfloat16 else embed
+        embed_np = embed_fp16.cpu().numpy()
+        print(f"  Quantizing LM head ({embed_np.shape}) to NF4...")
+        packed, absmax_f32, qmap = quantize_fp16_to_nf4(embed_np, block_size=64)
+
+        with open(bin_path, "ab") as f:
+            for lm_name, lm_data, lm_dtype, lm_shape in [
+                ("lm_head_nf4.weight", packed.tobytes(), "uint8",
+                 f"{embed_np.shape[0]},{embed_np.shape[1]//2}"),
+                ("lm_head_nf4.weight.absmax", absmax_f32.tobytes(), "float32",
+                 f"{len(absmax_f32)}"),
+                ("lm_head_nf4.weight.quant_map", qmap.tobytes(), "float32", "16"),
+            ]:
+                lines.append(f"{lm_name} {offset} {len(lm_data)} {lm_dtype} {lm_shape}")
+                f.write(lm_data)
+                offset += len(lm_data)
+        print(f"  LM head NF4: {packed.nbytes/1e6:.1f}MB packed + {absmax_f32.nbytes/1e3:.0f}KB absmax")
 
     with open(idx_path, "w") as f:
         for line in lines:

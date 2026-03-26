@@ -176,6 +176,17 @@ void InferenceEngine::load_weights(const std::string& prefix) {
         L.lora_gate = L.lora_up = L.lora_down = nullptr;
     }
     std::cout << "  All " << NUM_LAYERS << " layers loaded" << std::endl;
+
+    // Load NF4 LM head if available (quantized copy of embed_tokens for fast GEMV)
+    if (index.find("lm_head_nf4.weight") != index.end()) {
+        weights_.lm_head_nf4 = load_nf4("lm_head_nf4", VOCAB_SIZE, HIDDEN_SIZE);
+        weights_.has_nf4_lm_head = (weights_.lm_head_nf4.data != nullptr);
+        if (weights_.has_nf4_lm_head) {
+            std::cout << "  NF4 LM head loaded (saves "
+                      << (VOCAB_SIZE * HIDDEN_SIZE * 2 - VOCAB_SIZE * HIDDEN_SIZE / 2) / 1e6
+                      << "MB)" << std::endl;
+        }
+    }
 }
 
 void InferenceEngine::load_lora(const std::string& prefix, float scale) {

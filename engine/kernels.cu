@@ -982,6 +982,17 @@ void launch_gpu_sample(
     );
 }
 
+// Convert fp16 array to fp32 (for NF4 LM head → fp32 logits)
+__global__ void fp16_to_fp32_kernel(const half* input, float* output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) output[idx] = __half2float(input[idx]);
+}
+
+void launch_fp16_to_fp32(const half* input, float* output, int n, cudaStream_t stream) {
+    int blocks = (n + 255) / 256;
+    fp16_to_fp32_kernel<<<blocks, 256, 0, stream>>>(input, output, n);
+}
+
 void launch_argmax(
     const float* logits,
     int* result,

@@ -104,8 +104,13 @@ struct KVCache {
 
 // Full model weights
 struct ModelWeights {
-    // Embedding (fp16, shared with lm_head since tie_word_embeddings=True)
+    // Embedding (fp16, used for token lookup)
     half* embed_tokens;     // (VOCAB_SIZE, HIDDEN)
+
+    // LM head: NF4 quantized copy of embed_tokens for fast GEMV
+    // (saves 220MB vs fp16, similar speed due to memory-bound LM head)
+    NF4Weight lm_head_nf4;  // (VOCAB_SIZE, HIDDEN) in NF4
+    bool has_nf4_lm_head = false;
 
     // Transformer layers
     TransformerLayerWeights layers[qwen3::NUM_LAYERS];
@@ -142,6 +147,9 @@ struct InferenceState {
 
     // GPU-side sampling result
     int* sample_result; // single int on GPU
+
+    // NF4 LM head temp buffer (fp16 output before fp32 conversion)
+    half* lm_head_fp16_buf; // (VOCAB_SIZE,) — allocated if NF4 LM head loaded
 
     // LoRA scratch buffer (for A @ x intermediate, max rank = 64)
     half* lora_scratch; // (max_lora_rank,)

@@ -108,6 +108,7 @@ extern "C" {
     void launch_embedding(const half* embed_table, int token_id, half* output, int hidden_dim, cudaStream_t stream);
     void launch_residual_add(half* output, const half* residual, int dim, cudaStream_t stream);
     void launch_lm_head(const half* weight, const half* input, float* logits, int hidden_dim, int vocab_size, cudaStream_t stream);
+    void launch_fp16_to_fp32(const half* input, float* output, int n, cudaStream_t stream);
     void launch_argmax(const float* logits, int* result, int vocab_size, cudaStream_t stream);
     void launch_gpu_sample(float* logits, int* result, int vocab_size, float temperature, float random_val, float top_p, cudaStream_t stream);
     void launch_embedding_device(const half* embed_table, const int* d_token_id, half* output, int hidden_dim, cudaStream_t stream);
@@ -152,6 +153,9 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
 
     // GPU-side sampling
     cudaMallocTyped(&state_.sample_result, sizeof(int));
+
+    // NF4 LM head temp buffer (allocated upfront, ~304KB)
+    cudaMallocTyped(&state_.lm_head_fp16_buf, VOCAB_SIZE * sizeof(half));
 
     // LoRA scratch
     cudaMallocTyped(&state_.lora_scratch, 64 * sizeof(half)); // max rank 64
@@ -353,14 +357,17 @@ void InferenceEngine::decode(int token_id) {
     launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // LM head (tied to embedding) -> fp32 logits via cuBLAS mixed precision
-    {
+    // LM head -> fp32 logits
+    if (weights_.has_nf4_lm_head) {
+        // NF4 LM head: GEMV to fp16, then convert to fp32
+        auto& w = weights_.lm_head_nf4;
+        launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.lm_head_fp16_buf,
+                             w.out_dim, w.in_dim, w.block_size, stream);
+        launch_fp16_to_fp32(state_.lm_head_fp16_buf, state_.logits, VOCAB_SIZE, stream);
+    } else {
+        // fp16 cuBLAS (tied to embedding)
         ensure_cublas();
         float alpha = 1.0f, beta = 0.0f;
-        // embed_tokens is (VOCAB_SIZE, HIDDEN_SIZE) row-major
-        // We want logits[i] = embed[i,:] @ norm_out for all i
-        // = embed @ norm_out where embed is (VOCAB, HIDDEN) and norm_out is (HIDDEN, 1)
-        // cuBLAS col-major: embed^T is (HIDDEN, VOCAB), so CUBLAS_OP_T
         cublasGemmEx(cublas_handle,
                      CUBLAS_OP_T, CUBLAS_OP_N,
                      VOCAB_SIZE, 1, HIDDEN_SIZE,
@@ -369,7 +376,7 @@ void InferenceEngine::decode(int token_id) {
                      norm_out, CUDA_R_16F, HIDDEN_SIZE,
                      &beta,
                      state_.logits, CUDA_R_32F, VOCAB_SIZE,
-                     CUDA_R_32F,  // compute in fp32
+                     CUDA_R_32F,
                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     }
 
@@ -486,16 +493,26 @@ void InferenceEngine::enable_cuda_graph() {
     half* norm_out = state_.ffn_out;
     launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, graph_stream_);
-    // lm_head
-    {
-        float alpha = 1.0f, beta = 0.0f;
-        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                     VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
-                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
-                     norm_out, CUDA_R_16F, HIDDEN_SIZE,
-                     &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE,
-                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    }
+
+    // LM head helper for graph warmup + capture
+    auto lm_head_on_stream = [&](cudaStream_t s) {
+        if (weights_.has_nf4_lm_head) {
+            auto& w = weights_.lm_head_nf4;
+            launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.lm_head_fp16_buf,
+                                 w.out_dim, w.in_dim, w.block_size, s);
+            launch_fp16_to_fp32(state_.lm_head_fp16_buf, state_.logits, VOCAB_SIZE, s);
+        } else {
+            float alpha = 1.0f, beta = 0.0f;
+            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                         VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
+                         weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
+                         norm_out, CUDA_R_16F, HIDDEN_SIZE,
+                         &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE,
+                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+    };
+
+    lm_head_on_stream(graph_stream_);
     cudaStreamSynchronize(graph_stream_);
 
     // Now capture
@@ -508,15 +525,7 @@ void InferenceEngine::enable_cuda_graph() {
     }
     launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, graph_stream_);
-    {
-        float alpha = 1.0f, beta = 0.0f;
-        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                     VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
-                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
-                     norm_out, CUDA_R_16F, HIDDEN_SIZE,
-                     &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE,
-                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    }
+    lm_head_on_stream(graph_stream_);
 
     cudaStreamEndCapture(graph_stream_, &cuda_graph_);
     cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, nullptr, nullptr, 0);
