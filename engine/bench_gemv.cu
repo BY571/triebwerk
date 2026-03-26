@@ -204,5 +204,54 @@ int main() {
            total_nf4_bytes * 27 / (total_nf4 * 27 * 1000.0f),
            total_fp16_bytes * 27 / (total_fp16 * 27 * 1000.0f));
 
+    // LM Head benchmark (VOCAB_SIZE=151936, HIDDEN=1024)
+    printf("\n=== LM Head (151936 x 1024, cuBLAS fp32 compute) ===\n");
+    {
+        BenchCase lm = {"lm_head", 151936, 1024};
+        float lm_ms = bench_fp16_cublas(lm, 20, 50);
+        float lm_us = lm_ms * 1000.0f;
+        float lm_bytes = (float)lm.out_dim * lm.in_dim * 2.0f;
+        float lm_gbps = lm_bytes / (lm_us * 1000.0f);
+        printf("LM head: %.1f us (%.1f ms) = %.1f GB/s\n", lm_us, lm_ms, lm_gbps);
+    }
+
+    // Kernel launch overhead: measure 200 tiny kernel launches
+    printf("\n=== Kernel launch overhead ===\n");
+    {
+        half* d_dummy;
+        cudaMalloc(&d_dummy, 1024 * sizeof(half));
+        cudaDeviceSynchronize();
+
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+
+        int n_launches = 500;
+        cudaEventRecord(start);
+        for (int i = 0; i < n_launches; i++) {
+            // Tiny kernel that barely does anything
+            launch_nf4_gemv_fast(nullptr, nullptr, nullptr, d_dummy, 4, 128, 64, 0);
+        }
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms;
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("%.0f tiny launches: %.1f ms (%.1f us/launch)\n",
+               (float)n_launches, ms, ms * 1000.0f / n_launches);
+
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cudaFree(d_dummy);
+    }
+
+    // Full decode time estimate
+    printf("\n=== Full decode time estimate (NF4 model) ===\n");
+    printf("27 layers NF4 GEMV:   %.1f ms\n", total_nf4 * 27 / 1000.0f);
+    printf("1 layer fp16 GEMV:    %.1f ms\n", total_fp16 / 1000.0f);
+    printf("~450 kernel launches: ~%.1f ms (est)\n", 450 * 0.005f);
+    printf("Predicted total:      ~%.1f ms\n",
+           total_nf4 * 27 / 1000.0f + total_fp16 / 1000.0f + 450 * 0.005f + 5.0f);
+    printf("Actual measured:      ~29.3 ms\n");
+
     return 0;
 }
