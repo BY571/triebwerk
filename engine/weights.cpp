@@ -63,22 +63,8 @@ void InferenceEngine::load_weights(const std::string& prefix) {
     weights_.embed_tokens = load("embed_tokens.weight");
     weights_.final_layernorm = load("norm.weight");
 
-    for (int i = 0; i < NUM_LAYERS; i++) {
-        auto& L = weights_.layers[i];
-        std::string p = "layers." + std::to_string(i) + ".";
-        L.q_proj_fp16 = load(p + "self_attn.q_proj.weight");
-        L.k_proj_fp16 = load(p + "self_attn.k_proj.weight");
-        L.v_proj_fp16 = load(p + "self_attn.v_proj.weight");
-        L.o_proj_fp16 = load(p + "self_attn.o_proj.weight");
-        // MLP: check if NF4 (uint8) or fp16
-        std::string gw = p + "mlp.gate_proj.weight";
-        auto git = index.find(gw);
-        if (git != index.end() && git->second.dtype == "uint8") {
-            // NF4 mode: load packed data + dequantized absmax + quant_map
-            L.mlp_is_nf4 = true;
-            L.gate_proj_fp16 = L.up_proj_fp16 = L.down_proj_fp16 = nullptr;
-
-            auto load_nf4 = [&](const std::string& prefix, int out_dim, int in_dim) -> NF4Weight {
+    // NF4 loader (used for both attention and MLP)
+    auto load_nf4 = [&](const std::string& prefix, int out_dim, int in_dim) -> NF4Weight {
                 NF4Weight w = {};
                 w.out_dim = out_dim;
                 w.in_dim = in_dim;
@@ -104,16 +90,47 @@ void InferenceEngine::load_weights(const std::string& prefix) {
                     cudaMemcpy(p, base + it_q->second.offset, it_q->second.nbytes, cudaMemcpyHostToDevice);
                     w.quant_map = (float*)p;
                 }
-                return w;
-            };
+        return w;
+    };
 
+    // Helper: check if a weight is NF4 (uint8) or fp16
+    auto is_nf4 = [&](const std::string& name) -> bool {
+        auto it = index.find(name);
+        return it != index.end() && it->second.dtype == "uint8";
+    };
+
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        auto& L = weights_.layers[i];
+        std::string p = "layers." + std::to_string(i) + ".";
+
+        // Attention: check if NF4 or fp16
+        std::string qw = p + "self_attn.q_proj.weight";
+        if (is_nf4(qw)) {
+            L.attn_is_nf4 = true;
+            L.q_proj_fp16 = L.k_proj_fp16 = L.v_proj_fp16 = L.o_proj_fp16 = nullptr;
+            L.q_proj_nf4 = load_nf4(p + "self_attn.q_proj", Q_DIM, HIDDEN_SIZE);
+            L.k_proj_nf4 = load_nf4(p + "self_attn.k_proj", KV_DIM, HIDDEN_SIZE);
+            L.v_proj_nf4 = load_nf4(p + "self_attn.v_proj", KV_DIM, HIDDEN_SIZE);
+            L.o_proj_nf4 = load_nf4(p + "self_attn.o_proj", HIDDEN_SIZE, Q_DIM);
+        } else {
+            L.attn_is_nf4 = false;
+            L.q_proj_fp16 = load(qw);
+            L.k_proj_fp16 = load(p + "self_attn.k_proj.weight");
+            L.v_proj_fp16 = load(p + "self_attn.v_proj.weight");
+            L.o_proj_fp16 = load(p + "self_attn.o_proj.weight");
+        }
+
+        // MLP: check if NF4 or fp16
+        std::string gw = p + "mlp.gate_proj.weight";
+        if (is_nf4(gw)) {
+            L.mlp_is_nf4 = true;
+            L.gate_proj_fp16 = L.up_proj_fp16 = L.down_proj_fp16 = nullptr;
             L.gate_proj_nf4 = load_nf4(p + "mlp.gate_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
             L.up_proj_nf4 = load_nf4(p + "mlp.up_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
             L.down_proj_nf4 = load_nf4(p + "mlp.down_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE);
         } else {
-            // fp16 mode
             L.mlp_is_nf4 = false;
-            L.gate_proj_fp16 = load(p + "mlp.gate_proj.weight");
+            L.gate_proj_fp16 = load(gw);
             L.up_proj_fp16 = load(p + "mlp.up_proj.weight");
             L.down_proj_fp16 = load(p + "mlp.down_proj.weight");
         }

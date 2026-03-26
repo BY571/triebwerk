@@ -21,6 +21,7 @@ static void ensure_cublas() {
     if (!cublas_handle) {
         cublasCreate(&cublas_handle);
         cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
+        cublasSetStream(cublas_handle, 0);  // force default stream
     }
 }
 
@@ -243,10 +244,20 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_rms_norm(state_.residual, layer.input_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // 2. QKV projections (with LoRA if available)
-    cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
-    cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
-    cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
+    // 2. QKV projections (fp16 or NF4 depending on layer)
+    if (layer.attn_is_nf4) {
+        auto& q = layer.q_proj_nf4; auto& k = layer.k_proj_nf4; auto& v = layer.v_proj_nf4;
+        launch_nf4_gemv(q.data, q.absmax, q.quant_map, norm_out, state_.q_buf, q.out_dim, q.in_dim, q.block_size, stream);
+        cudaStreamSynchronize(stream);  // DEBUG: sync after NF4 GEMV
+        launch_nf4_gemv(k.data, k.absmax, k.quant_map, norm_out, state_.k_buf, k.out_dim, k.in_dim, k.block_size, stream);
+        cudaStreamSynchronize(stream);
+        launch_nf4_gemv(v.data, v.absmax, v.quant_map, norm_out, state_.v_buf, v.out_dim, v.in_dim, v.block_size, stream);
+        cudaStreamSynchronize(stream);
+    } else {
+        cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
+        cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
+        cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
+    }
 
     // 2b. Fused QKNorm (one kernel for all 24 heads instead of 24 separate launches)
     launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm,
@@ -267,8 +278,13 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out,
                           state_.attn_scores, state_.current_pos, state_.max_seq_len, stream);
 
-    // 6. Output projection (with LoRA)
-    cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
+    // 6. Output projection (fp16 or NF4)
+    if (layer.attn_is_nf4) {
+        auto& o = layer.o_proj_nf4;
+        launch_nf4_gemv(o.data, o.absmax, o.quant_map, state_.attn_out, state_.hidden, o.out_dim, o.in_dim, o.block_size, stream);
+    } else {
+        cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
+    }
 
     // 7. Residual add (hidden += residual)
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
@@ -362,10 +378,17 @@ void InferenceEngine::forward_layer_graph(int layer_idx, cudaStream_t stream) {
     launch_rms_norm(state_.residual, layer.input_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // QKV projections with LoRA
-    cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
-    cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
-    cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
+    // QKV projections (fp16 or NF4)
+    if (layer.attn_is_nf4) {
+        auto& q = layer.q_proj_nf4; auto& k = layer.k_proj_nf4; auto& v = layer.v_proj_nf4;
+        launch_nf4_gemv(q.data, q.absmax, q.quant_map, norm_out, state_.q_buf, q.out_dim, q.in_dim, q.block_size, stream);
+        launch_nf4_gemv(k.data, k.absmax, k.quant_map, norm_out, state_.k_buf, k.out_dim, k.in_dim, k.block_size, stream);
+        launch_nf4_gemv(v.data, v.absmax, v.quant_map, norm_out, state_.v_buf, v.out_dim, v.in_dim, v.block_size, stream);
+    } else {
+        cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
+        cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
+        cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
+    }
 
     // Fused QKNorm
     launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm,
@@ -384,8 +407,13 @@ void InferenceEngine::forward_layer_graph(int layer_idx, cudaStream_t stream) {
                                  state_.attn_scores, state_.d_pos,
                                  state_.max_seq_len, stream);
 
-    // Output projection with LoRA
-    cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
+    // Output projection (fp16 or NF4)
+    if (layer.attn_is_nf4) {
+        auto& o = layer.o_proj_nf4;
+        launch_nf4_gemv(o.data, o.absmax, o.quant_map, state_.attn_out, state_.hidden, o.out_dim, o.in_dim, o.block_size, stream);
+    } else {
+        cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
+    }
 
     // Residual add
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
@@ -685,10 +713,11 @@ std::vector<int> InferenceEngine::generate(
     int token = sample_gpu(temperature, top_p);
     std::vector<int> output = {token};
 
-    // Enable CUDA graph after prefill (first generate call captures the graph)
-    if (!graph_captured_ && prompt.size() > 0) {
-        enable_cuda_graph();
-    }
+    // CUDA graph currently only works with fp16 weights (NF4+cuBLAS stream mismatch)
+    // TODO: fix graph capture for mixed NF4/cuBLAS layers
+    // if (!graph_captured_ && prompt.size() > 0) {
+    //     enable_cuda_graph();
+    // }
 
     // Decode loop (CUDA graph replay, no Python, all GPU sampling)
     for (int i = 0; i < max_new_tokens - 1; i++) {

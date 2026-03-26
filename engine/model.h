@@ -54,11 +54,18 @@ struct LoRAAdapter {
 
 // One transformer layer's weights
 struct TransformerLayerWeights {
-    // Attention (fp16 in unsloth quantized model — attention is NOT quantized)
-    half* q_proj_fp16;      // (Q_DIM, HIDDEN) = (2048, 1024)
-    half* k_proj_fp16;      // (KV_DIM, HIDDEN) = (1024, 1024)
-    half* v_proj_fp16;      // (KV_DIM, HIDDEN) = (1024, 1024)
-    half* o_proj_fp16;      // (HIDDEN, Q_DIM) = (1024, 2048)
+    // Attention: fp16 for layer 0, NF4 for layers 1-27 in unsloth model
+    // Only one of fp16 or nf4 is non-null per projection
+    half* q_proj_fp16;      // (Q_DIM, HIDDEN) if fp16
+    half* k_proj_fp16;      // (KV_DIM, HIDDEN) if fp16
+    half* v_proj_fp16;      // (KV_DIM, HIDDEN) if fp16
+    half* o_proj_fp16;      // (HIDDEN, Q_DIM) if fp16
+
+    NF4Weight q_proj_nf4;   // if NF4
+    NF4Weight k_proj_nf4;   // if NF4
+    NF4Weight v_proj_nf4;   // if NF4
+    NF4Weight o_proj_nf4;   // if NF4
+    bool attn_is_nf4 = false;
 
     // MLP: either fp16 (dequantized) or NF4 (native quantized)
     // Only one of these is non-null per layer
