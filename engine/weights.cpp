@@ -14,7 +14,16 @@
 #include <vector>
 #include <cstring>
 
-using namespace qwen3;
+// Runtime config aliases (same as engine.cpp — macros reference config_ member)
+#define HIDDEN_SIZE config_.hidden_size
+#define INTERMEDIATE_SIZE config_.intermediate_size
+#define NUM_LAYERS config_.num_layers
+#define NUM_HEADS config_.num_heads
+#define NUM_KV_HEADS config_.num_kv_heads
+#define HEAD_DIM config_.head_dim
+#define VOCAB_SIZE config_.vocab_size
+#define Q_DIM config_.q_dim()
+#define KV_DIM config_.kv_dim()
 
 struct TensorInfo {
     size_t offset;
@@ -43,6 +52,10 @@ static std::unordered_map<std::string, TensorInfo> load_index(const std::string&
 }
 
 void InferenceEngine::load_weights(const std::string& prefix) {
+    // Load model config (try config.json next to weights, fall back to default)
+    config_ = ModelConfig::from_json(prefix + ".config.json");
+    allocate_buffers();
+
     auto index = load_index(prefix + ".idx");
     std::ifstream f(prefix + ".bin", std::ios::binary | std::ios::ate);
     size_t sz = f.tellg(); f.seekg(0);

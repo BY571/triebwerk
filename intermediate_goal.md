@@ -4,6 +4,17 @@
 
 End-to-end GRPO training on Jetson Orin Nano 8GB using our custom C++ inference engine for generation. If the model learns (reward improves over training steps), the approach is validated and we proceed to make it a general library.
 
+## Core principle: dead-simple onboarding
+
+RL fine-tuning is intimidating. Our #1 differentiator beyond speed is **ease of use**. A user with a Jetson and a reward function should go from zero to training in under 5 minutes. This means:
+
+- **Single-command install** (`pip install jetson-llm-train` or one Docker command)
+- **Minimal boilerplate** — define your reward function, call `train()`, done
+- **No CUDA/C++ knowledge required** — the engine is invisible to users
+- **HuggingFace-native output** — LoRA adapters load with `PeftModel.from_pretrained()`, no vendor lock-in
+- **Clear, complete documentation** with copy-paste examples for common tasks (GSM8K, code gen, instruction following)
+- **Complete performance comparison vs TRL** — users need to see exactly what they gain: wall-clock time per step, peak memory, tok/s, and final model quality (reward curves, eval accuracy) side by side on the same hardware with the same hyperparameters. No hand-waving — reproducible benchmarks with scripts included.
+
 ## Scope
 
 ### What this is
@@ -102,3 +113,16 @@ model = PeftModel.from_pretrained(base_model, "checkpoint/")
 - [ ] HuggingFace PEFT export
 - [ ] pip-installable package with pre-built CUDA wheels
 - [ ] README, docs, benchmarks
+
+### Onboarding & UX
+- [ ] `pip install` or single Docker command — no manual CUDA compilation
+- [ ] 5-line quickstart: load model, define reward, train
+- [ ] Example scripts for common tasks (GSM8K math, code gen, instruction following)
+- [ ] Clear error messages when hardware doesn't meet requirements
+
+### TRL comparison benchmarks (must ship with the library)
+- [ ] Reproducible benchmark script: `benchmark/compare_trl.py`
+- [ ] Side-by-side metrics: tok/s, step time, peak memory, GPU utilization
+- [ ] Training quality: reward curves, eval accuracy at 300 steps (identical hyperparams)
+- [ ] Hardware matrix: Jetson Orin 8GB, Jetson Orin 16GB, RTX 3090, RTX 4090
+- [ ] Published results table in README with methodology notes

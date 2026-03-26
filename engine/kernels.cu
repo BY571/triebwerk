@@ -453,7 +453,7 @@ __global__ void gqa_attention_decode_kernel(
     // Score computation: each thread handles some positions
     float max_score = -1e30f;
     for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
-        const half* k_p = k_cache + p * qwen3::KV_DIM + kv_head * head_dim;
+        const half* k_p = k_cache + p * (num_kv_heads * head_dim) + kv_head * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             dot += __half2float(q_head[d]) * __half2float(k_p[d]);
@@ -516,7 +516,7 @@ __global__ void gqa_attention_decode_kernel(
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float val = 0.0f;
         for (int p = 0; p <= pos; p++) {
-            val += scores[p] * __half2float(v_cache[p * qwen3::KV_DIM + kv_head * head_dim + d]);
+            val += scores[p] * __half2float(v_cache[p * (num_kv_heads * head_dim) + kv_head * head_dim + d]);
         }
         out_head[d] = __float2half(val);
     }
@@ -898,16 +898,17 @@ void launch_rope(
     half* q, half* k,
     const half* cos_table, const half* sin_table,
     int pos, int max_seq_len,
+    int num_heads, int num_kv_heads, int head_dim,
     cudaStream_t stream
 ) {
-    int n = qwen3::NUM_HEADS * qwen3::HEAD_DIM / 2;
+    int n = num_heads * head_dim / 2;
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     rope_kernel<<<blocks, threads, 0, stream>>>(
         q, k,
-        cos_table + pos * (qwen3::HEAD_DIM / 2),
-        sin_table + pos * (qwen3::HEAD_DIM / 2),
-        qwen3::NUM_HEADS, qwen3::NUM_KV_HEADS, qwen3::HEAD_DIM
+        cos_table + pos * (head_dim / 2),
+        sin_table + pos * (head_dim / 2),
+        num_heads, num_kv_heads, head_dim
     );
 }
 
@@ -917,13 +918,14 @@ void launch_gqa_attention(
     half* output,
     float* attn_scratch,
     int pos, int max_seq_len,
+    int num_heads, int num_kv_heads, int head_dim,
     cudaStream_t stream
 ) {
     // One block per Q head, 128 threads per block
-    gqa_attention_decode_kernel<<<qwen3::NUM_HEADS, 128, 0, stream>>>(
+    gqa_attention_decode_kernel<<<num_heads, 128, 0, stream>>>(
         q, k_cache, v_cache, output, attn_scratch,
         nullptr, pos, max_seq_len,
-        qwen3::NUM_HEADS, qwen3::NUM_KV_HEADS, qwen3::HEAD_DIM
+        num_heads, num_kv_heads, head_dim
     );
 }
 
@@ -951,25 +953,28 @@ void launch_rope_device(
     half* q, half* k,
     const half* cos_table_base, const half* sin_table_base,
     const int* d_pos,
+    int num_heads, int num_kv_heads, int head_dim,
     cudaStream_t stream
 ) {
-    int n = qwen3::NUM_HEADS * qwen3::HEAD_DIM / 2;
+    int n = num_heads * head_dim / 2;
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     rope_device_kernel<<<blocks, threads, 0, stream>>>(
         q, k, cos_table_base, sin_table_base, d_pos,
-        qwen3::NUM_HEADS, qwen3::NUM_KV_HEADS, qwen3::HEAD_DIM
+        num_heads, num_kv_heads, head_dim
     );
 }
 
 void launch_gqa_attention_device(
     const half* q, const half* k_cache, const half* v_cache,
     half* output, float* attn_scratch, const int* d_pos,
-    int max_seq_len, cudaStream_t stream
+    int max_seq_len,
+    int num_heads, int num_kv_heads, int head_dim,
+    cudaStream_t stream
 ) {
-    gqa_attention_decode_kernel<<<qwen3::NUM_HEADS, 128, 0, stream>>>(
+    gqa_attention_decode_kernel<<<num_heads, 128, 0, stream>>>(
         q, k_cache, v_cache, output, attn_scratch, d_pos, 0,
-        max_seq_len, qwen3::NUM_HEADS, qwen3::NUM_KV_HEADS, qwen3::HEAD_DIM
+        max_seq_len, num_heads, num_kv_heads, head_dim
     );
 }
 
@@ -1037,15 +1042,15 @@ void launch_gpu_sample(
 // All activation buffers are (dim, G) column-major.
 // ============================================================================
 
-// Batched embedding: tokens[G] -> hidden (HIDDEN_SIZE, G)
+// Batched embedding: tokens[G] -> hidden (hidden_size, G)
 __global__ void embed_batch_kernel(
-    half* hidden, const half* embed_table, const int* tokens, int G
+    half* hidden, const half* embed_table, const int* tokens, int G, int hidden_size
 ) {
     int g = blockIdx.x;
     if (g >= G) return;
     int token = tokens[g];
-    for (int d = threadIdx.x; d < qwen3::HIDDEN_SIZE; d += blockDim.x)
-        hidden[d + g * qwen3::HIDDEN_SIZE] = embed_table[token * qwen3::HIDDEN_SIZE + d];
+    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x)
+        hidden[d + g * hidden_size] = embed_table[token * hidden_size + d];
 }
 
 // Batched RMSNorm: (dim, G) -> (dim, G), weight is (dim,)
@@ -1097,10 +1102,11 @@ __global__ void residual_add_batch_kernel(half* out, const half* res, int total)
     }
 }
 
-// Batched QKNorm: apply per-head RMSNorm to Q (Q_DIM, G) and K (KV_DIM, G)
+// Batched QKNorm: apply per-head RMSNorm to Q (q_dim, G) and K (kv_dim, G)
 __global__ void qk_norm_batch_kernel(
     half* q, half* k, const half* q_w, const half* k_w,
-    int num_q, int num_kv, int head_dim, int G, float eps
+    int num_q, int num_kv, int head_dim, int G, float eps,
+    int q_dim, int kv_dim
 ) {
     int block_id = blockIdx.x;  // over total_heads * G
     int g = block_id / (num_q + num_kv);
@@ -1109,7 +1115,7 @@ __global__ void qk_norm_batch_kernel(
 
     bool is_q = head_in_block < num_q;
     int head_idx = is_q ? head_in_block : (head_in_block - num_q);
-    int dim_total = is_q ? qwen3::Q_DIM : qwen3::KV_DIM;
+    int dim_total = is_q ? q_dim : kv_dim;
     half* data = is_q ? (q + g * dim_total + head_idx * head_dim)
                       : (k + g * dim_total + head_idx * head_dim);
     const half* w = is_q ? q_w : k_w;
@@ -1138,19 +1144,20 @@ __global__ void qk_norm_batch_kernel(
         data[i] = __float2half(__half2float(data[i]) * rms * __half2float(w[i]));
 }
 
-// Batched RoPE: apply to Q (Q_DIM, G) and K (KV_DIM, G) with positions[G]
+// Batched RoPE: apply to Q (q_dim, G) and K (kv_dim, G) with positions[G]
 __global__ void rope_batch_kernel(
     half* q, half* k, const half* cos_table, const half* sin_table,
-    const int* positions, int max_seq_len, int G
+    const int* positions, int max_seq_len, int G,
+    int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim
 ) {
     int g = blockIdx.x;
     if (g >= G) return;
     int pos = positions[g];
-    int half_dim = qwen3::HEAD_DIM / 2;
+    int half_dim = head_dim / 2;
 
     // Apply to all Q heads
-    for (int h = 0; h < qwen3::NUM_HEADS; h++) {
-        half* qh = q + g * qwen3::Q_DIM + h * qwen3::HEAD_DIM;
+    for (int h = 0; h < num_heads; h++) {
+        half* qh = q + g * q_dim + h * head_dim;
         for (int d = threadIdx.x; d < half_dim; d += blockDim.x) {
             float c = __half2float(cos_table[pos * half_dim + d]);
             float s_val = __half2float(sin_table[pos * half_dim + d]);
@@ -1161,8 +1168,8 @@ __global__ void rope_batch_kernel(
         }
     }
     // Apply to all KV heads
-    for (int h = 0; h < qwen3::NUM_KV_HEADS; h++) {
-        half* kh = k + g * qwen3::KV_DIM + h * qwen3::HEAD_DIM;
+    for (int h = 0; h < num_kv_heads; h++) {
+        half* kh = k + g * kv_dim + h * head_dim;
         for (int d = threadIdx.x; d < half_dim; d += blockDim.x) {
             float c = __half2float(cos_table[pos * half_dim + d]);
             float s_val = __half2float(sin_table[pos * half_dim + d]);
@@ -1174,46 +1181,48 @@ __global__ void rope_batch_kernel(
     }
 }
 
-// Batched KV cache write: K (KV_DIM, G), V (KV_DIM, G) -> cache at positions[G]
+// Batched KV cache write: K (kv_dim, G), V (kv_dim, G) -> cache at positions[G]
 __global__ void kv_cache_write_batch_kernel(
     half* cache_k, half* cache_v, const half* k, const half* v,
-    const int* positions, int max_seq_len, int G
+    const int* positions, int max_seq_len, int G, int kv_dim
 ) {
     int g = blockIdx.x;
     if (g >= G) return;
     int pos = positions[g];
-    for (int d = threadIdx.x; d < qwen3::KV_DIM; d += blockDim.x) {
-        int src = d + g * qwen3::KV_DIM;
-        int dst = (g * max_seq_len + pos) * qwen3::KV_DIM + d;
+    for (int d = threadIdx.x; d < kv_dim; d += blockDim.x) {
+        int src = d + g * kv_dim;
+        int dst = (g * max_seq_len + pos) * kv_dim + d;
         cache_k[dst] = k[src];
         cache_v[dst] = v[src];
     }
 }
 
-// Batched GQA attention: Q (Q_DIM, G) x KV_cache -> attn_out (Q_DIM, G)
+// Batched GQA attention: Q (q_dim, G) x KV_cache -> attn_out (q_dim, G)
 // One block per (g, head) pair
 __global__ void gqa_attention_batch_kernel(
     half* out, const half* q, const half* cache_k, const half* cache_v,
     float* attn_scratch, const int* positions,
-    int max_seq_len, int G
+    int max_seq_len, int G,
+    int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim
 ) {
     int g = blockIdx.x;
     int head = blockIdx.y;
-    if (g >= G || head >= qwen3::NUM_HEADS) return;
+    if (g >= G || head >= num_heads) return;
 
+    int gqa_groups = num_heads / num_kv_heads;
     int pos = positions[g];
-    int kv_head = head / qwen3::GQA_GROUPS;
-    float scale = rsqrtf((float)qwen3::HEAD_DIM);
+    int kv_head = head / gqa_groups;
+    float scale = rsqrtf((float)head_dim);
 
-    const half* qh = q + g * qwen3::Q_DIM + head * qwen3::HEAD_DIM;
-    float* scores = attn_scratch + (g * qwen3::NUM_HEADS + head) * max_seq_len;
+    const half* qh = q + g * q_dim + head * head_dim;
+    float* scores = attn_scratch + (g * num_heads + head) * max_seq_len;
 
     // Score computation
     float max_score = -1e30f;
     for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
-        const half* kp = cache_k + (g * max_seq_len + p) * qwen3::KV_DIM + kv_head * qwen3::HEAD_DIM;
+        const half* kp = cache_k + (g * max_seq_len + p) * kv_dim + kv_head * head_dim;
         float dot = 0.0f;
-        for (int d = 0; d < qwen3::HEAD_DIM; d++)
+        for (int d = 0; d < head_dim; d++)
             dot += __half2float(qh[d]) * __half2float(kp[d]);
         dot *= scale;
         scores[p] = dot;
@@ -1261,11 +1270,11 @@ __global__ void gqa_attention_batch_kernel(
     __syncthreads();
 
     // Weighted sum of V
-    half* oh = out + g * qwen3::Q_DIM + head * qwen3::HEAD_DIM;
-    for (int d = threadIdx.x; d < qwen3::HEAD_DIM; d += blockDim.x) {
+    half* oh = out + g * q_dim + head * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float val = 0.0f;
         for (int p = 0; p <= pos; p++)
-            val += scores[p] * __half2float(cache_v[(g * max_seq_len + p) * qwen3::KV_DIM + kv_head * qwen3::HEAD_DIM + d]);
+            val += scores[p] * __half2float(cache_v[(g * max_seq_len + p) * kv_dim + kv_head * head_dim + d]);
         oh[d] = __float2half(val);
     }
 }
@@ -1392,8 +1401,8 @@ void launch_sample_batch(float* logits, int* tokens, const float* randoms,
 }
 
 // Launch wrappers for batch kernels
-void launch_embed_batch(half* h, const half* et, const int* tok, int G, cudaStream_t s) {
-    embed_batch_kernel<<<G, 256, 0, s>>>(h, et, tok, G);
+void launch_embed_batch(half* h, const half* et, const int* tok, int G, int hidden_size, cudaStream_t s) {
+    embed_batch_kernel<<<G, 256, 0, s>>>(h, et, tok, G, hidden_size);
 }
 void launch_rms_norm_batch(half* out, const half* in, const half* w, int dim, int G, float eps, cudaStream_t s) {
     rms_norm_batch_kernel<<<G, 256, 0, s>>>(out, in, w, dim, G, eps);
@@ -1404,18 +1413,18 @@ void launch_copy_batch(half* dst, const half* src, int total, cudaStream_t s) {
 void launch_residual_add_batch(half* out, const half* res, int total, cudaStream_t s) {
     residual_add_batch_kernel<<<(total+255)/256, 256, 0, s>>>(out, res, total);
 }
-void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, cudaStream_t s) {
-    qk_norm_batch_kernel<<<G * (nq + nkv), 128, 0, s>>>(q, k, qw, kw, nq, nkv, hd, G, eps);
+void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, int q_dim, int kv_dim, cudaStream_t s) {
+    qk_norm_batch_kernel<<<G * (nq + nkv), 128, 0, s>>>(q, k, qw, kw, nq, nkv, hd, G, eps, q_dim, kv_dim);
 }
-void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, cudaStream_t s) {
-    rope_batch_kernel<<<G, 256, 0, s>>>(q, k, ct, st, pos, msl, G);
+void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s) {
+    rope_batch_kernel<<<G, 256, 0, s>>>(q, k, ct, st, pos, msl, G, num_heads, num_kv_heads, head_dim, q_dim, kv_dim);
 }
-void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, cudaStream_t s) {
-    kv_cache_write_batch_kernel<<<G, 256, 0, s>>>(ck, cv, k, v, pos, msl, G);
+void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, int kv_dim, cudaStream_t s) {
+    kv_cache_write_batch_kernel<<<G, 256, 0, s>>>(ck, cv, k, v, pos, msl, G, kv_dim);
 }
-void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, cudaStream_t s) {
-    dim3 grid(G, qwen3::NUM_HEADS);
-    gqa_attention_batch_kernel<<<grid, 128, 0, s>>>(out, q, ck, cv, as, pos, msl, G);
+void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s) {
+    dim3 grid(G, num_heads);
+    gqa_attention_batch_kernel<<<grid, 128, 0, s>>>(out, q, ck, cv, as, pos, msl, G, num_heads, num_kv_heads, head_dim, q_dim, kv_dim);
 }
 void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s) {
     silu_mul_batch_kernel<<<(total+255)/256, 256, 0, s>>>(gate, up, total);

@@ -341,12 +341,45 @@ def convert_q4l(args):
     print(f"Saved {len(lines)} tensors ({total_mb:.1f}MB, {n_q4l} Q4L projections)")
 
 
+def write_model_config(model_name, output_prefix):
+    """Write config.json alongside weights for runtime model config.
+
+    Reads the HuggingFace config and writes the fields the C++ engine needs.
+    """
+    from transformers import AutoConfig
+    hf_config = AutoConfig.from_pretrained(model_name)
+
+    config = {
+        "hidden_size": hf_config.hidden_size,
+        "intermediate_size": hf_config.intermediate_size,
+        "num_hidden_layers": hf_config.num_hidden_layers,
+        "num_attention_heads": hf_config.num_attention_heads,
+        "num_key_value_heads": hf_config.num_key_value_heads,
+        "head_dim": getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads),
+        "vocab_size": hf_config.vocab_size,
+        "rms_norm_eps": hf_config.rms_norm_eps,
+        "rope_theta": hf_config.rope_theta,
+    }
+
+    config_path = output_prefix + ".config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Model config saved to {config_path}")
+    print(f"  {config['hidden_size']}h, {config['intermediate_size']}i, "
+          f"{config['num_hidden_layers']}L, {config['num_attention_heads']}Qh, "
+          f"{config['num_key_value_heads']}KVh, {config['head_dim']}hd, "
+          f"{config['vocab_size']}V")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="unsloth/Qwen3-0.6B-unsloth-bnb-4bit")
     parser.add_argument("--output", default="engine/weights")
     parser.add_argument("--mode", choices=["fp16", "nf4", "q4l"], default="fp16")
     args = parser.parse_args()
+
+    # Write model config JSON (used by C++ engine at runtime)
+    write_model_config(args.model, args.output)
 
     if args.mode == "nf4":
         convert_nf4(args)

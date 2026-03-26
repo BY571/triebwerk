@@ -5,21 +5,44 @@
 #include <vector>
 #include <string>
 
-// Qwen3-0.6B architecture constants
-namespace qwen3 {
-    constexpr int HIDDEN_SIZE = 1024;
-    constexpr int INTERMEDIATE_SIZE = 3072;
-    constexpr int NUM_LAYERS = 28;
-    constexpr int NUM_HEADS = 16;       // Q heads
-    constexpr int NUM_KV_HEADS = 8;     // KV heads (GQA ratio = 2)
-    constexpr int HEAD_DIM = 128;
-    constexpr int VOCAB_SIZE = 151936;
-    constexpr int Q_DIM = NUM_HEADS * HEAD_DIM;     // 2048
-    constexpr int KV_DIM = NUM_KV_HEADS * HEAD_DIM; // 1024
-    constexpr float RMS_NORM_EPS = 1e-6f;
-    constexpr float ROPE_THETA = 1000000.0f;
-    constexpr int GQA_GROUPS = NUM_HEADS / NUM_KV_HEADS; // 2
-}
+// Maximum number of transformer layers (covers all Qwen3 variants)
+constexpr int MAX_LAYERS = 128;
+
+// Runtime model configuration — loaded from config.json alongside weights.
+// Replaces the old compile-time qwen3:: namespace.
+struct ModelConfig {
+    int hidden_size;
+    int intermediate_size;
+    int num_layers;
+    int num_heads;          // Q heads
+    int num_kv_heads;       // KV heads (GQA)
+    int head_dim;
+    int vocab_size;
+    float rms_norm_eps;
+    float rope_theta;
+
+    // Derived dimensions
+    int q_dim() const { return num_heads * head_dim; }
+    int kv_dim() const { return num_kv_heads * head_dim; }
+    int gqa_groups() const { return num_heads / num_kv_heads; }
+
+    // Built-in presets
+    static ModelConfig qwen3_0_6b() {
+        return {1024, 3072, 28, 16, 8, 128, 151936, 1e-6f, 1000000.0f};
+    }
+    static ModelConfig qwen3_1_7b() {
+        return {2048, 6144, 28, 16, 8, 128, 151936, 1e-6f, 1000000.0f};
+    }
+    static ModelConfig qwen3_4b() {
+        return {2560, 9216, 36, 32, 8, 128, 151936, 1e-6f, 1000000.0f};
+    }
+    static ModelConfig qwen3_8b() {
+        return {4096, 12288, 36, 32, 8, 128, 151936, 1e-6f, 1000000.0f};
+    }
+
+    // Load from JSON file (written by convert_weights.py)
+    static ModelConfig from_json(const std::string& path);
+};
 
 // NF4 quantized weight: stored as uint8 (2 values per byte) + quantization metadata
 struct NF4Weight {
@@ -114,8 +137,8 @@ struct ModelWeights {
     NF4Weight lm_head_nf4;  // (VOCAB_SIZE, HIDDEN) in NF4
     bool has_nf4_lm_head = false;
 
-    // Transformer layers
-    TransformerLayerWeights layers[qwen3::NUM_LAYERS];
+    // Transformer layers (dynamic count, up to MAX_LAYERS)
+    TransformerLayerWeights layers[MAX_LAYERS];
 
     // Final norm
     half* final_layernorm;  // (HIDDEN,)
@@ -126,8 +149,8 @@ struct ModelWeights {
 
 // Inference state (pre-allocated buffers)
 struct InferenceState {
-    // KV caches for all layers
-    KVCache kv_cache[qwen3::NUM_LAYERS];
+    // KV caches for all layers (dynamic count, up to MAX_LAYERS)
+    KVCache kv_cache[MAX_LAYERS];
     int max_seq_len;
     int current_pos;    // current position in KV cache
 
@@ -190,8 +213,8 @@ struct BatchState {
     float* attn_scores; // (G * NUM_HEADS * max_seq_len)
 
     // Batched KV cache: (G * max_seq_len * KV_DIM) per layer
-    half* kv_keys[qwen3::NUM_LAYERS];
-    half* kv_values[qwen3::NUM_LAYERS];
+    half* kv_keys[MAX_LAYERS];
+    half* kv_values[MAX_LAYERS];
 
     // Q4L dequant scratch (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
     half* dequant_scratch;
@@ -266,7 +289,10 @@ public:
     bool use_cuda_graph_ = false;
     void enable_cuda_graph();  // capture after first decode
 
+    const ModelConfig& config() const { return config_; }
+
 private:
+    ModelConfig config_;
     ModelWeights weights_;
     InferenceState state_;
 
@@ -288,6 +314,9 @@ private:
 
     // Graph-accelerated decode (capture on first call, replay after)
     void decode_graph(int token_id);
+
+    // Allocate GPU buffers (called from load_weights after config is known)
+    void allocate_buffers();
 
     // Precompute RoPE cos/sin tables
     void precompute_rope();

@@ -96,5 +96,19 @@ PYBIND11_MODULE(jetson_engine, m) {
                  return d;
              },
              py::arg("token_id"),
-             "Profile one decode step, returns dict of {operation: time_us}");
+             "Profile one decode step, returns dict of {operation: time_us}")
+
+        .def("model_config", [](InferenceEngine& self) {
+                 const auto& c = self.config();
+                 py::dict d;
+                 d["hidden_size"] = c.hidden_size;
+                 d["intermediate_size"] = c.intermediate_size;
+                 d["num_layers"] = c.num_layers;
+                 d["num_heads"] = c.num_heads;
+                 d["num_kv_heads"] = c.num_kv_heads;
+                 d["head_dim"] = c.head_dim;
+                 d["vocab_size"] = c.vocab_size;
+                 return d;
+             },
+             "Get model configuration (loaded from config.json alongside weights)");
 }

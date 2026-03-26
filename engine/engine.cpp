@@ -108,22 +108,22 @@ extern "C" {
     void launch_dequant_q4l(half* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
 
     // Batched kernel launchers
-    void launch_embed_batch(half* h, const half* et, const int* tok, int G, cudaStream_t s);
+    void launch_embed_batch(half* h, const half* et, const int* tok, int G, int hidden_size, cudaStream_t s);
     void launch_rms_norm_batch(half* out, const half* in, const half* w, int dim, int G, float eps, cudaStream_t s);
     void launch_copy_batch(half* dst, const half* src, int total, cudaStream_t s);
     void launch_residual_add_batch(half* out, const half* res, int total, cudaStream_t s);
-    void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, cudaStream_t s);
-    void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, cudaStream_t s);
-    void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, cudaStream_t s);
-    void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, cudaStream_t s);
+    void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, int q_dim, int kv_dim, cudaStream_t s);
+    void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
+    void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, int kv_dim, cudaStream_t s);
+    void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, int num_heads, int num_kv_heads, int head_dim, int q_dim, int kv_dim, cudaStream_t s);
     void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s);
     void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cudaStream_t s);
     void launch_sample_batch(float* logits, int* tokens, const float* randoms, int vocab, int G, float temperature, float top_p, cudaStream_t s);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
-    void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, cudaStream_t stream);
-    void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, cudaStream_t stream);
+    void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
+    void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
     void launch_silu_gate_mul(const half* gate, const half* up, half* output, int dim, cudaStream_t stream);
     void launch_embedding(const half* embed_table, int token_id, half* output, int hidden_dim, cudaStream_t stream);
     void launch_residual_add(half* output, const half* residual, int dim, cudaStream_t stream);
@@ -132,12 +132,59 @@ extern "C" {
     void launch_argmax(const float* logits, int* result, int vocab_size, cudaStream_t stream);
     void launch_gpu_sample(float* logits, int* result, int vocab_size, float temperature, float random_val, float top_p, cudaStream_t stream);
     void launch_embedding_device(const half* embed_table, const int* d_token_id, half* output, int hidden_dim, cudaStream_t stream);
-    void launch_rope_device(half* q, half* k, const half* cos_table_base, const half* sin_table_base, const int* d_pos, cudaStream_t stream);
-    void launch_gqa_attention_device(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, const int* d_pos, int max_seq_len, cudaStream_t stream);
+    void launch_rope_device(half* q, half* k, const half* cos_table_base, const half* sin_table_base, const int* d_pos, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
+    void launch_gqa_attention_device(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, const int* d_pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
     void launch_kv_cache_write(half* k_cache, half* v_cache, const half* k_new, const half* v_new, const int* d_pos, int kv_dim, cudaStream_t stream);
 }
 
-using namespace qwen3;
+// JSON config parser (simple, no external dependency)
+#include <fstream>
+#include <sstream>
+
+ModelConfig ModelConfig::from_json(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        std::cerr << "WARNING: config not found at " << path << ", using Qwen3-0.6B defaults" << std::endl;
+        return qwen3_0_6b();
+    }
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    // Minimal JSON parser for flat int/float fields
+    auto get_int = [&](const char* key) -> int {
+        std::string needle = std::string("\"") + key + "\"";
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) return -1;
+        pos = json.find(':', pos);
+        return std::stoi(json.substr(pos + 1));
+    };
+    auto get_float = [&](const char* key) -> float {
+        std::string needle = std::string("\"") + key + "\"";
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) return -1.0f;
+        pos = json.find(':', pos);
+        return std::stof(json.substr(pos + 1));
+    };
+
+    ModelConfig c;
+    c.hidden_size = get_int("hidden_size");
+    c.intermediate_size = get_int("intermediate_size");
+    c.num_layers = get_int("num_hidden_layers");
+    c.num_heads = get_int("num_attention_heads");
+    c.num_kv_heads = get_int("num_key_value_heads");
+    c.head_dim = get_int("head_dim");
+    c.vocab_size = get_int("vocab_size");
+    c.rms_norm_eps = get_float("rms_norm_eps");
+    c.rope_theta = get_float("rope_theta");
+
+    // Fallback for head_dim if not in config
+    if (c.head_dim <= 0 && c.hidden_size > 0 && c.num_heads > 0)
+        c.head_dim = c.hidden_size / c.num_heads;
+
+    std::cout << "  Config: " << c.hidden_size << "h, " << c.intermediate_size << "i, "
+              << c.num_layers << "L, " << c.num_heads << "Qh, " << c.num_kv_heads << "KVh, "
+              << c.head_dim << "hd, " << c.vocab_size << "V" << std::endl;
+    return c;
+}
 
 // Dispatch macros: use dp4a for Q4L, fallback to fp32 FMA for NF4
 #define GEMV_4BIT(w, in, out, stream) \
@@ -150,13 +197,37 @@ using namespace qwen3;
     do { if (weights_.is_q4l) launch_q4l_fused_3((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (cw).data, (cw).absmax, (cy), (cw).out_dim, (x), (id), (stream)); \
          else launch_nf4_fused_3((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (cw).data, (cw).absmax, (cy), (cw).out_dim, (x), (id), (stream)); } while(0)
 
+// Runtime config aliases — these macros replace the old compile-time qwen3:: namespace.
+// They expand to config_ member access, so they work in all InferenceEngine methods.
+#define HIDDEN_SIZE config_.hidden_size
+#define INTERMEDIATE_SIZE config_.intermediate_size
+#define NUM_LAYERS config_.num_layers
+#define NUM_HEADS config_.num_heads
+#define NUM_KV_HEADS config_.num_kv_heads
+#define HEAD_DIM config_.head_dim
+#define VOCAB_SIZE config_.vocab_size
+#define Q_DIM config_.q_dim()
+#define KV_DIM config_.kv_dim()
+#define RMS_NORM_EPS config_.rms_norm_eps
+#define ROPE_THETA config_.rope_theta
+#define GQA_GROUPS config_.gqa_groups()
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
 
 InferenceEngine::InferenceEngine(int max_seq_len) {
+    // Config and buffers are allocated in load_weights() when we know the model dims.
+    // Here we just store max_seq_len and zero-init pointers.
+    config_ = ModelConfig::qwen3_0_6b(); // default, overwritten by load_weights
+    state_ = {};
     state_.max_seq_len = max_seq_len;
     state_.current_pos = 0;
+    batch_ = nullptr;
+}
+
+void InferenceEngine::allocate_buffers() {
+    int max_seq_len = state_.max_seq_len;
 
     // Allocate KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -208,7 +279,6 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
 
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
-    batch_ = nullptr;
 }
 
 InferenceEngine::~InferenceEngine() {
@@ -361,7 +431,8 @@ void InferenceEngine::forward_layer(int layer_idx) {
     // 3. RoPE
     launch_rope(state_.q_buf, state_.k_buf,
                 state_.rope_cos, state_.rope_sin,
-                state_.current_pos, state_.max_seq_len, stream);
+                state_.current_pos, state_.max_seq_len,
+                NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
 
     // 4. Store K, V into cache at current position
     cudaMemcpyAsync(kv.key + state_.current_pos * KV_DIM, state_.k_buf,
@@ -371,7 +442,8 @@ void InferenceEngine::forward_layer(int layer_idx) {
 
     // 5. GQA Attention
     launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out,
-                          state_.attn_scores, state_.current_pos, state_.max_seq_len, stream);
+                          state_.attn_scores, state_.current_pos, state_.max_seq_len,
+                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
 
     // 6. Output projection (input: attn_out, dim=Q_DIM)
     if (!layer.o_proj_fp16 && weights_.is_q4l) {
@@ -519,10 +591,10 @@ std::vector<std::pair<std::string, float>> InferenceEngine::profile_decode(int t
         // QKNorm + RoPE + KV cache + Attention
         timed("attn_ops", [&]{
             launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, RMS_NORM_EPS, stream);
-            launch_rope(state_.q_buf, state_.k_buf, state_.rope_cos, state_.rope_sin, state_.current_pos, state_.max_seq_len, stream);
+            launch_rope(state_.q_buf, state_.k_buf, state_.rope_cos, state_.rope_sin, state_.current_pos, state_.max_seq_len, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
             cudaMemcpyAsync(kv.key + state_.current_pos * KV_DIM, state_.k_buf, KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
             cudaMemcpyAsync(kv.value + state_.current_pos * KV_DIM, state_.v_buf, KV_DIM * sizeof(half), cudaMemcpyDeviceToDevice, stream);
-            launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out, state_.attn_scores, state_.current_pos, state_.max_seq_len, stream);
+            launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out, state_.attn_scores, state_.current_pos, state_.max_seq_len, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
         });
 
         // O proj
@@ -636,7 +708,8 @@ void InferenceEngine::forward_layer_graph(int layer_idx, cudaStream_t stream) {
 
     // RoPE (reads position from device memory)
     launch_rope_device(state_.q_buf, state_.k_buf,
-                       state_.rope_cos, state_.rope_sin, state_.d_pos, stream);
+                       state_.rope_cos, state_.rope_sin, state_.d_pos,
+                       NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
 
     // KV cache write (reads position from device memory)
     launch_kv_cache_write(kv.key, kv.value, state_.k_buf, state_.v_buf,
@@ -645,7 +718,8 @@ void InferenceEngine::forward_layer_graph(int layer_idx, cudaStream_t stream) {
     // GQA Attention (reads position from device memory)
     launch_gqa_attention_device(state_.q_buf, kv.key, kv.value, state_.attn_out,
                                  state_.attn_scores, state_.d_pos,
-                                 state_.max_seq_len, stream);
+                                 state_.max_seq_len,
+                                 NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
 
     // Output projection (fp16 or NF4)
     if (layer.o_proj_fp16) cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
@@ -1091,18 +1165,22 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
 
     // 3. QKNorm + RoPE
     launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
-                         NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, G, RMS_NORM_EPS, stream);
+                         NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, G, RMS_NORM_EPS,
+                         Q_DIM, KV_DIM, stream);
     launch_rope_batch(B->q_buf, B->k_buf, state_.rope_cos, state_.rope_sin,
-                      B->d_positions, B->max_seq_len, G, stream);
+                      B->d_positions, B->max_seq_len, G,
+                      NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
 
     // 4. KV cache write
     launch_kv_cache_write_batch(B->kv_keys[layer_idx], B->kv_values[layer_idx],
-                                 B->k_buf, B->v_buf, B->d_positions, B->max_seq_len, G, stream);
+                                 B->k_buf, B->v_buf, B->d_positions, B->max_seq_len, G,
+                                 KV_DIM, stream);
 
     // 5. GQA attention
     launch_gqa_attention_batch(B->attn_out, B->q_buf,
                                 B->kv_keys[layer_idx], B->kv_values[layer_idx],
-                                B->attn_scores, B->d_positions, B->max_seq_len, G, stream);
+                                B->attn_scores, B->d_positions, B->max_seq_len, G,
+                                NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
 
     // 6. Output projection (input: attn_out, not norm_buf)
     project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM);
@@ -1130,7 +1208,7 @@ void InferenceEngine::decode_batch(int G) {
     auto* B = batch_;
 
     // Embedding
-    launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, stream);
+    launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, HIDDEN_SIZE, stream);
 
     if (debug_mode) { cudaDeviceSynchronize(); fprintf(stderr, "[B] embed: "); dump_half("h", B->hidden, 8); }
 
