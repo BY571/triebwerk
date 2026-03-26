@@ -283,7 +283,7 @@ static void dump_float(const char* label, const float* d, int n) {
     for (int i = 0; i < std::min(n, 8); i++) fprintf(stderr, " %.4f", h[i]);
     fprintf(stderr, "\n"); fflush(stderr);
 }
-static int debug_mode = 1;
+static int debug_mode = 0;
 
 // ============================================================================
 // Forward pass through one transformer layer
@@ -1101,17 +1101,11 @@ void InferenceEngine::decode_batch(int G) {
     // Embedding
     launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, stream);
 
-    // Always debug first batch token
-    {
-        cudaDeviceSynchronize();
-        fprintf(stderr, "[B] embed: "); dump_half("h", B->hidden, 8);
-    }
+    if (debug_mode) { cudaDeviceSynchronize(); fprintf(stderr, "[B] embed: "); dump_half("h", B->hidden, 8); }
 
     // Forward layers
     for (int i = 0; i < NUM_LAYERS; i++)
         forward_layer_batch(i, G, stream);
-
-    { cudaDeviceSynchronize(); fprintf(stderr, "[B] after layers: "); dump_half("h", B->hidden, 8); }
 
     // Final norm
     launch_rms_norm_batch(B->norm_buf, B->hidden, weights_.final_layernorm,
