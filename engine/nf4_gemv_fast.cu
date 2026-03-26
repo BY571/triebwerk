@@ -52,44 +52,35 @@ __device__ __forceinline__ void q4l_gemv_block(
             int base_j = vi << 3;
             float scale = __ldg(&scales[scale_row_start + (base_j >> 6)]);
 
-            // Byte 0: linear dequant (nibble - 8) * scale — no lookup!
+            // dp4a-friendly packing: low nibbles = elem[0..3], high nibbles = elem[4..7]
+            // Byte k: lo_nib = elem[k], hi_nib = elem[k+4]
             uint8_t b0 = packed4 & 0xFF;
-            float w0 = ((float)(b0 >> 4) - 8.0f) * scale;
-            float w1 = ((float)(b0 & 0xF) - 8.0f) * scale;
+            uint8_t b1 = (packed4 >> 8) & 0xFF;
+            uint8_t b2 = (packed4 >> 16) & 0xFF;
+            uint8_t b3 = (packed4 >> 24) & 0xFF;
+
+            // Elements 0-3 (low nibbles of bytes 0-3)
+            float w0 = ((float)(b0 & 0xF) - 8.0f) * scale;
+            float w1 = ((float)(b1 & 0xF) - 8.0f) * scale;
+            float w2 = ((float)(b2 & 0xF) - 8.0f) * scale;
+            float w3 = ((float)(b3 & 0xF) - 8.0f) * scale;
             sum = __fmaf_rn(w0, __half2float(__ldg(&input[base_j])), sum);
             sum = __fmaf_rn(w1, __half2float(__ldg(&input[base_j + 1])), sum);
-
-            // Byte 1
-            uint8_t b1 = (packed4 >> 8) & 0xFF;
-            float w2 = ((float)(b1 >> 4) - 8.0f) * scale;
-            float w3 = ((float)(b1 & 0xF) - 8.0f) * scale;
             sum = __fmaf_rn(w2, __half2float(__ldg(&input[base_j + 2])), sum);
             sum = __fmaf_rn(w3, __half2float(__ldg(&input[base_j + 3])), sum);
 
-            // Byte 2
-            uint8_t b2 = (packed4 >> 16) & 0xFF;
-            float w4 = ((float)(b2 >> 4) - 8.0f) * scale;
-            float w5 = ((float)(b2 & 0xF) - 8.0f) * scale;
+            // Elements 4-7 (high nibbles of bytes 0-3)
+            float w4 = ((float)(b0 >> 4) - 8.0f) * scale;
+            float w5 = ((float)(b1 >> 4) - 8.0f) * scale;
+            float w6 = ((float)(b2 >> 4) - 8.0f) * scale;
+            float w7 = ((float)(b3 >> 4) - 8.0f) * scale;
             sum = __fmaf_rn(w4, __half2float(__ldg(&input[base_j + 4])), sum);
             sum = __fmaf_rn(w5, __half2float(__ldg(&input[base_j + 5])), sum);
-
-            // Byte 3
-            uint8_t b3 = (packed4 >> 24) & 0xFF;
-            float w6 = ((float)(b3 >> 4) - 8.0f) * scale;
-            float w7 = ((float)(b3 & 0xF) - 8.0f) * scale;
             sum = __fmaf_rn(w6, __half2float(__ldg(&input[base_j + 6])), sum);
             sum = __fmaf_rn(w7, __half2float(__ldg(&input[base_j + 7])), sum);
         }
 
-        // Remainder
-        int rem_start = vec_per_row << 2;
-        for (int bi = rem_start + threadIdx.x; bi < bytes_per_row; bi += THREADS_PER_BLOCK) {
-            uint8_t packed = __ldg(&weight_data[row_byte_start + bi]);
-            int j0 = bi * 2;
-            float sc = __ldg(&scales[scale_row_start + (j0 >> 6)]);
-            sum = __fmaf_rn(((float)(packed >> 4) - 8.0f) * sc, __half2float(__ldg(&input[j0])), sum);
-            sum = __fmaf_rn(((float)(packed & 0xF) - 8.0f) * sc, __half2float(__ldg(&input[j0 + 1])), sum);
-        }
+        // No remainder needed: all Qwen3 dims are multiples of 8
 
         // Warp + cross-warp reduction
         #pragma unroll
@@ -261,18 +252,17 @@ __global__ void quantize_input_q8_kernel(
 __device__ __forceinline__ void q4l_dp4a_gemv_block(
     float* __restrict__ s_sums,
     const uint8_t* __restrict__ weight_data,
-    const float* __restrict__ w_scales,   // per-64-element weight scale
-    const int8_t* __restrict__ q8_data,   // quantized input (int8)
-    const float* __restrict__ q8_scales,  // per-64-element input scale
-    const float* __restrict__ q8_sums_arr,// per-64-element sum of q8 values
+    const float* __restrict__ w_scales,
+    const int8_t* __restrict__ q8_data,
+    const float* __restrict__ q8_scales,
+    const float* __restrict__ q8_sums_arr,
     half* __restrict__ output,
     int first_row, int out_dim, int in_dim
 ) {
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
     const int bytes_per_row = in_dim / 2;
-    const int blocks_per_row = in_dim >> 6;  // in_dim / 64
-    // Each 4 packed bytes = 8 Q4L values → 2 dp4a instructions
+    const int blocks_per_row = in_dim >> 6;
     const int vec_per_row = bytes_per_row >> 2;
 
     for (int r = 0; r < ROWS_PER_BLOCK; r++) {
@@ -286,78 +276,37 @@ __device__ __forceinline__ void q4l_dp4a_gemv_block(
             weight_data + row_byte_start);
 
         for (int vi = threadIdx.x; vi < vec_per_row; vi += THREADS_PER_BLOCK) {
-            // Load 4 weight bytes (8 nibbles)
             uint32_t packed = __ldg(&row_u32[vi]);
             int base_elem = vi << 3;
-
-            // Weight scale for this 64-element block
             int w_blk = base_elem >> 6;
             float w_sc = __ldg(&w_scales[w_scale_start + w_blk]);
-
-            // Input scale and sum for this block
             float x_sc = __ldg(&q8_scales[w_blk]);
-            float x_sum = __ldg(&q8_sums_arr[w_blk]);
 
-            // Extract nibbles into int32 as unsigned bytes (0-15)
-            int vi_lo = (packed >> 0) & 0x0F0F0F0F;  // nibbles at positions 0,2,4,6
-            int vi_hi = (packed >> 4) & 0x0F0F0F0F;  // nibbles at positions 1,3,5,7
+            // dp4a-friendly extraction (matches packing from convert_weights.py):
+            // lo nibbles = elements [0,1,2,3], hi nibbles = elements [4,5,6,7]
+            int vi_lo = (packed >> 0) & 0x0F0F0F0F;
+            int vi_hi = (packed >> 4) & 0x0F0F0F0F;
 
-            // Load quantized input as int32 (4 × int8)
             const int* q8_i32 = reinterpret_cast<const int*>(&q8_data[base_elem]);
-            int u0 = __ldg(&q8_i32[0]);  // elements 0,1,2,3
-            int u1 = __ldg(&q8_i32[1]);  // elements 4,5,6,7
+            int u0 = __ldg(&q8_i32[0]);  // q8[0..3]
+            int u1 = __ldg(&q8_i32[1]);  // q8[4..7]
 
-            // dp4a: 4 MACs per instruction (8 total for 8 elements)
+            // dp4a: sumi = sum(nibble_i * q8_i) for 8 elements
             int sumi = 0;
             sumi = __dp4a(vi_lo, u0, sumi);
             sumi = __dp4a(vi_hi, u1, sumi);
 
-            // Convert to float with scale correction:
-            // dot = w_sc * x_sc * sumi - w_sc * x_sc * 8 * (sum of q8 in these 8 elements)
-            // Approximate: use per-block x_sum scaled by 8/64 for 8 out of 64 elements
-            // More precise: accumulate sumi and correct at block boundaries
-            sum += w_sc * x_sc * (float)sumi;
+            // Compute sum of q8 values for these 8 elements using dp4a trick:
+            // dp4a(0x01010101, q8_i32, 0) = q8[0] + q8[1] + q8[2] + q8[3]
+            int q8_sum_local = 0;
+            q8_sum_local = __dp4a(0x01010101, u0, q8_sum_local);
+            q8_sum_local = __dp4a(0x01010101, u1, q8_sum_local);
 
-            // Offset correction: accumulated per block at boundaries
-            // The 8 elements we processed contribute (8/64) of the block's q8_sum
-            // Correction: -8 * w_sc * x_sc * (8/64 * x_sum) = -w_sc * x_sc * x_sum
-            // Actually: for 8 out of 64 elements, the correction is:
-            // -8 * w_sc * sum(q8 for these 8 elements) * ...
-            // The exact correction needs per-element q8 sums, which is complex.
-            // Simpler: correct at the end of each full 64-element block.
+            // dot = ws * xs * (sumi - 8 * q8_sum) for these 8 elements
+            sum += w_sc * x_sc * ((float)sumi - 8.0f * (float)q8_sum_local);
         }
 
-        // Apply offset correction per block
-        // For each 64-element block: correction = -8 * w_scale * q8_scale * q8_sum_for_block
-        // We process multiple blocks per thread across iterations, need per-block tracking
-        // Simplification: re-traverse blocks for correction (cheap)
-        float offset = 0.0f;
-        for (int blk = warp_id; blk < blocks_per_row; blk += N_WARPS) {
-            if (lane_id == 0) {
-                float ws = __ldg(&w_scales[w_scale_start + blk]);
-                float xs = __ldg(&q8_scales[blk]);
-                float qs = __ldg(&q8_sums_arr[blk]);
-                offset += -8.0f * ws * xs * qs;
-            }
-        }
-        // Broadcast offset from lane 0 of each warp, then reduce
-        offset = __shfl_sync(0xFFFFFFFF, offset, 0);
-        if (warp_id == 0 && lane_id == 0) {
-            float total_offset = 0;
-            for (int blk = 0; blk < blocks_per_row; blk++) {
-                float ws = __ldg(&w_scales[w_scale_start + blk]);
-                float xs = __ldg(&q8_scales[blk]);
-                float qs = __ldg(&q8_sums_arr[blk]);
-                total_offset += -8.0f * ws * xs * qs;
-            }
-            // Store in shared memory for all threads to use
-            s_sums[ROWS_PER_BLOCK * N_WARPS] = total_offset; // use extra slot
-        }
-        __syncthreads();
-        // Actually, the offset is a per-row scalar. Only thread 0 computes it.
-        // Let me simplify: add offset only to the final reduced result.
-
-        // Warp + cross-warp reduction for the dp4a sum
+        // Warp + cross-warp reduction
         #pragma unroll
         for (int off = 16; off > 0; off /= 2)
             sum += __shfl_down_sync(0xFFFFFFFF, sum, off);
@@ -368,17 +317,7 @@ __device__ __forceinline__ void q4l_dp4a_gemv_block(
             #pragma unroll
             for (int off = 16; off > 0; off /= 2)
                 total += __shfl_down_sync(0xFFFFFFFF, total, off);
-            if (lane_id == 0) {
-                // Add offset correction
-                float row_offset = 0.0f;
-                for (int blk = 0; blk < blocks_per_row; blk++) {
-                    float ws = w_scales[w_scale_start + blk];
-                    float xs = q8_scales[blk];
-                    float qs = q8_sums_arr[blk];
-                    row_offset += ws * xs * qs;
-                }
-                output[row] = __float2half(total - 8.0f * row_offset);
-            }
+            if (lane_id == 0) output[row] = __float2half(total);
         }
         __syncthreads();
     }

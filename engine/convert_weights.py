@@ -32,8 +32,21 @@ NF4_TABLE = np.array([
 
 
 def quantize_fp16_to_q4l(weight_fp16, block_size=64):
-    """Quantize fp16 weight to linear Q4 format (like Q4_0).
+    """Quantize fp16 weight to linear Q4 format with dp4a-friendly packing.
     Dequant at inference: (nibble - 8) * scale.
+
+    Packing (Q4_0-style for dp4a compatibility):
+      For each group of 8 elements [e0..e7]:
+        byte[0] = e0 | (e4 << 4)
+        byte[1] = e1 | (e5 << 4)
+        byte[2] = e2 | (e6 << 4)
+        byte[3] = e3 | (e7 << 4)
+
+      dp4a extraction:
+        (packed >> 0) & 0x0F0F0F0F = [e0, e1, e2, e3]  (low nibbles)
+        (packed >> 4) & 0x0F0F0F0F = [e4, e5, e6, e7]  (high nibbles)
+      Both sequential, pairing correctly with q8[0:3] and q8[4:7].
+
     Returns (packed_uint8, scales_float32)."""
     w = weight_fp16.astype(np.float32).flatten()
     n = len(w)
@@ -41,18 +54,23 @@ def quantize_fp16_to_q4l(weight_fp16, block_size=64):
     n_blocks = n // block_size
 
     blocks = w.reshape(n_blocks, block_size)
-    # Per-block scale = max absolute value / 7.5 (so that ±7 maps to ±max)
     maxabs = np.max(np.abs(blocks), axis=1)
     scales = (maxabs / 7.5).astype(np.float32)
     scales = np.maximum(scales, 1e-10)
 
-    # Quantize: nibble = round(val / scale) + 8, clamped to [0, 15]
-    normalized = blocks / scales[:, None]  # range ~[-8, 8]
+    normalized = blocks / scales[:, None]
     nibbles = np.clip(np.round(normalized + 8.0), 0, 15).astype(np.uint8)
 
-    # Pack pairs into bytes (hi nibble first, same as NF4)
+    # dp4a-friendly packing: for each group of 8 elements, interleave
+    # first-4 into low nibbles and second-4 into high nibbles
     flat = nibbles.flatten()
-    packed = (flat[0::2] << 4) | flat[1::2]
+    n_groups = n // 8
+    groups = flat.reshape(n_groups, 8)
+    # groups[:,0:4] = first 4 elements (go to low nibbles)
+    # groups[:,4:8] = next 4 elements (go to high nibbles)
+    packed = np.zeros(n // 2, dtype=np.uint8)
+    for i in range(4):
+        packed[i::4] = groups[:, i] | (groups[:, i + 4] << 4)
 
     return packed, scales
 
