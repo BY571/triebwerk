@@ -105,6 +105,19 @@ extern "C" {
     void launch_q4l_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_quantize_input_q8(const half* input, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, cudaStream_t stream);
     void launch_q4l_dp4a_gemv(const uint8_t* w, const float* w_scales, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
+    void launch_dequant_q4l(half* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
+
+    // Batched kernel launchers
+    void launch_embed_batch(half* h, const half* et, const int* tok, int G, cudaStream_t s);
+    void launch_rms_norm_batch(half* out, const half* in, const half* w, int dim, int G, float eps, cudaStream_t s);
+    void launch_copy_batch(half* dst, const half* src, int total, cudaStream_t s);
+    void launch_residual_add_batch(half* out, const half* res, int total, cudaStream_t s);
+    void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, cudaStream_t s);
+    void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, cudaStream_t s);
+    void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, cudaStream_t s);
+    void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, cudaStream_t s);
+    void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s);
+    void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cudaStream_t s);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
@@ -194,7 +207,7 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
 
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
-}
+    batch_ = nullptr;
 
 InferenceEngine::~InferenceEngine() {
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -926,4 +939,212 @@ std::vector<int> InferenceEngine::generate(
     }
 
     return output;
+}
+
+// ============================================================================
+// Batched generation: G sequences in parallel (GEMM, tensor cores)
+// ============================================================================
+
+void InferenceEngine::alloc_batch(int G, int max_seq_len) {
+    if (batch_ && batch_->G >= G && batch_->max_seq_len >= max_seq_len) return;
+    if (batch_) { /* TODO: free old */ }
+    batch_ = new BatchState();
+    batch_->G = G;
+    batch_->max_seq_len = max_seq_len;
+
+    cudaMalloc(&batch_->hidden, HIDDEN_SIZE * G * sizeof(half));
+    cudaMalloc(&batch_->residual, HIDDEN_SIZE * G * sizeof(half));
+    cudaMalloc(&batch_->norm_buf, HIDDEN_SIZE * G * sizeof(half));
+    cudaMalloc(&batch_->q_buf, Q_DIM * G * sizeof(half));
+    cudaMalloc(&batch_->k_buf, KV_DIM * G * sizeof(half));
+    cudaMalloc(&batch_->v_buf, KV_DIM * G * sizeof(half));
+    cudaMalloc(&batch_->attn_out, Q_DIM * G * sizeof(half));
+    cudaMalloc(&batch_->gate_buf, INTERMEDIATE_SIZE * G * sizeof(half));
+    cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half));
+    cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float));
+    cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float));
+    // Dequant scratch: largest projection
+    cudaMalloc(&batch_->dequant_scratch, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
+    // KV caches
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
+        cudaMalloc(&batch_->kv_values[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
+    }
+    // Per-sequence state
+    batch_->h_positions = new int[G]();
+    cudaMalloc(&batch_->d_positions, G * sizeof(int));
+    batch_->h_tokens = new int[G]();
+    cudaMalloc(&batch_->d_tokens, G * sizeof(int));
+    batch_->h_finished = new bool[G]();
+
+    std::cout << "  Batch allocated: G=" << G << " max_seq=" << max_seq_len
+              << " KV=" << (G * max_seq_len * KV_DIM * 2 * NUM_LAYERS * 2 / 1e6) << "MB" << std::endl;
+}
+
+void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
+                                  int M, int N, int K, cudaStream_t stream) {
+    ensure_cublas();
+    // weight is (M, K) row-major = (K, M) col-major
+    // in is (K, N) col-major (already correct)
+    // out is (M, N) col-major
+    __half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+    cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                 M, N, K, &alpha,
+                 weight, CUDA_R_16F, K,   // A^T: (K,M) -> (M,K)
+                 in, CUDA_R_16F, K,       // B: (K,N)
+                 &beta, out, CUDA_R_16F, M,  // C: (M,N)
+                 CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
+                                      int N, cudaStream_t stream) {
+    // Dequantize Q4L to fp16 scratch, then cuBLAS GEMM
+    launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
+                       w.out_dim, w.in_dim, stream);
+    batch_gemm(out, batch_->dequant_scratch, in, w.out_dim, N, w.in_dim, stream);
+}
+
+void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t stream) {
+    auto& L = weights_.layers[layer_idx];
+    auto* B = batch_;
+
+    // 1. Copy hidden -> residual, RMSNorm -> norm_buf
+    launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
+    launch_rms_norm_batch(B->norm_buf, B->residual, L.input_layernorm,
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
+
+    // 2. QKV projections (GEMM)
+    auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, int out_dim, int in_dim) {
+        if (fp16w) batch_gemm(out, fp16w, B->norm_buf, out_dim, G, in_dim, stream);
+        else batch_gemm_q4l(out, nf4w, B->norm_buf, G, stream);
+    };
+    project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, Q_DIM, HIDDEN_SIZE);
+    project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, KV_DIM, HIDDEN_SIZE);
+    project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, KV_DIM, HIDDEN_SIZE);
+
+    // 3. QKNorm + RoPE
+    launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
+                         NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, G, RMS_NORM_EPS, stream);
+    launch_rope_batch(B->q_buf, B->k_buf, state_.rope_cos, state_.rope_sin,
+                      B->d_positions, B->max_seq_len, G, stream);
+
+    // 4. KV cache write
+    launch_kv_cache_write_batch(B->kv_keys[layer_idx], B->kv_values[layer_idx],
+                                 B->k_buf, B->v_buf, B->d_positions, B->max_seq_len, G, stream);
+
+    // 5. GQA attention
+    launch_gqa_attention_batch(B->attn_out, B->q_buf,
+                                B->kv_keys[layer_idx], B->kv_values[layer_idx],
+                                B->attn_scores, B->d_positions, B->max_seq_len, G, stream);
+
+    // 6. Output projection
+    project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, HIDDEN_SIZE, Q_DIM);
+
+    // 7. Residual add
+    launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
+
+    // 8. Post-attention norm
+    launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
+    launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
+
+    // 9. FFN: gate, up, SiLU, down
+    project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * G, stream);
+    project(B->hidden, L.down_proj_fp16, L.down_proj_nf4, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+
+    // 10. Residual add
+    launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
+}
+
+void InferenceEngine::decode_batch(int G) {
+    cudaStream_t stream = 0;
+    auto* B = batch_;
+
+    // Embedding
+    launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, stream);
+
+    // Forward layers
+    for (int i = 0; i < NUM_LAYERS; i++)
+        forward_layer_batch(i, G, stream);
+
+    // Final norm
+    launch_rms_norm_batch(B->norm_buf, B->hidden, weights_.final_layernorm,
+                          HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
+
+    // LM head: (VOCAB_SIZE, HIDDEN_SIZE) @ (HIDDEN_SIZE, G) -> (VOCAB_SIZE, G) in fp32
+    {
+        ensure_cublas();
+        float alpha = 1.0f, beta = 0.0f;
+        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     VOCAB_SIZE, G, HIDDEN_SIZE, &alpha,
+                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
+                     B->norm_buf, CUDA_R_16F, HIDDEN_SIZE,
+                     &beta, B->logits, CUDA_R_32F, VOCAB_SIZE,
+                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+}
+
+std::vector<std::vector<int>> InferenceEngine::generate_batch(
+    const std::vector<std::vector<int>>& prompts,
+    int max_new_tokens, float temperature, float top_p, int eos_token_id
+) {
+    int G = prompts.size();
+    int max_prompt_len = 0;
+    for (auto& p : prompts) max_prompt_len = std::max(max_prompt_len, (int)p.size());
+    int total_max_len = max_prompt_len + max_new_tokens;
+
+    alloc_batch(G, total_max_len);
+    auto* B = batch_;
+
+    // Reset
+    for (int i = 0; i < G; i++) { B->h_positions[i] = 0; B->h_finished[i] = false; }
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+        cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+    }
+
+    std::vector<std::vector<int>> outputs(G);
+
+    // Phase 1: Prefill (token by token, all G sequences in parallel)
+    for (int t = 0; t < max_prompt_len; t++) {
+        for (int g = 0; g < G; g++)
+            B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
+        cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
+
+        decode_batch(G);
+
+        for (int g = 0; g < G; g++)
+            if (t < (int)prompts[g].size()) B->h_positions[g]++;
+    }
+
+    // Phase 2: Decode (generate new tokens)
+    for (int step = 0; step < max_new_tokens; step++) {
+        // Sample from logits
+        launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, 0);
+        cudaMemcpy(B->h_tokens, B->d_tokens, G * sizeof(int), cudaMemcpyDeviceToHost);
+
+        // Check stopping
+        bool all_done = true;
+        for (int g = 0; g < G; g++) {
+            if (!B->h_finished[g]) {
+                outputs[g].push_back(B->h_tokens[g]);
+                if (B->h_tokens[g] == eos_token_id) B->h_finished[g] = true;
+                else all_done = false;
+            }
+        }
+        if (all_done) break;
+
+        // Advance positions
+        for (int g = 0; g < G; g++)
+            if (!B->h_finished[g]) B->h_positions[g]++;
+        cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
+
+        decode_batch(G);
+    }
+
+    return outputs;
 }

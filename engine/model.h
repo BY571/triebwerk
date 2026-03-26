@@ -169,6 +169,41 @@ struct InferenceState {
     int* d_pos;         // current position (for RoPE, attention, KV cache)
 };
 
+// Batched generation state (G sequences in parallel)
+struct BatchState {
+    int G;              // batch size (number of sequences)
+    int max_seq_len;
+
+    // Activation buffers: (dim, G) column-major for cuBLAS
+    half* hidden;       // (HIDDEN_SIZE, G)
+    half* residual;     // (HIDDEN_SIZE, G)
+    half* norm_buf;     // (HIDDEN_SIZE, G) temp for norm output
+    half* q_buf;        // (Q_DIM, G)
+    half* k_buf;        // (KV_DIM, G)
+    half* v_buf;        // (KV_DIM, G)
+    half* attn_out;     // (Q_DIM, G)
+    half* gate_buf;     // (INTERMEDIATE_SIZE, G)
+    half* up_buf;       // (INTERMEDIATE_SIZE, G)
+    float* logits;      // (VOCAB_SIZE, G) fp32
+
+    // Attention scratch
+    float* attn_scores; // (G * NUM_HEADS * max_seq_len)
+
+    // Batched KV cache: (G * max_seq_len * KV_DIM) per layer
+    half* kv_keys[qwen3::NUM_LAYERS];
+    half* kv_values[qwen3::NUM_LAYERS];
+
+    // Q4L dequant scratch (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
+    half* dequant_scratch;
+
+    // Per-sequence state
+    int* h_positions;   // host (G,)
+    int* d_positions;   // device (G,)
+    int* h_tokens;      // host (G,) sampled tokens
+    int* d_tokens;      // device (G,)
+    bool* h_finished;   // host (G,)
+};
+
 // Top-level engine
 class InferenceEngine {
 public:
@@ -217,6 +252,14 @@ public:
                                int eos_token_id = -1,
                                const std::vector<int>& stop_token_ids = {});
 
+    // Batched generation (G sequences in parallel, GEMM with tensor cores)
+    std::vector<std::vector<int>> generate_batch(
+        const std::vector<std::vector<int>>& prompts,
+        int max_new_tokens = 512,
+        float temperature = 1.0f,
+        float top_p = 0.9f,
+        int eos_token_id = -1);
+
     // CUDA graph for fast decode replay
     bool use_cuda_graph_ = false;
     void enable_cuda_graph();  // capture after first decode
@@ -255,6 +298,19 @@ private:
 
     // FFN: gate * silu(up) then down
     void ffn(int layer_idx);
+
+    // Batch generation internals
+    BatchState* batch_;  // allocated on first generate_batch call
+    void alloc_batch(int G, int max_seq_len);
+    void decode_batch(int G);
+    void forward_layer_batch(int layer_idx, int G, cudaStream_t stream);
+
+    // Batched GEMM: (M,K) @ (K,N) -> (M,N) where N=G
+    void batch_gemm(half* out, const half* weight, const half* in,
+                    int M, int N, int K, cudaStream_t stream);
+    // Q4L batch: dequant to scratch then cuBLAS GEMM
+    void batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
+                        int N, cudaStream_t stream);
 
 public:
     // Profile one decode step: returns vector of (name, time_us) pairs

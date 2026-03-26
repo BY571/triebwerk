@@ -1032,6 +1032,311 @@ void launch_gpu_sample(
     );
 }
 
+// ============================================================================
+// BATCHED kernels for generate_batch (G sequences in parallel)
+// All activation buffers are (dim, G) column-major.
+// ============================================================================
+
+// Batched embedding: tokens[G] -> hidden (HIDDEN_SIZE, G)
+__global__ void embed_batch_kernel(
+    half* hidden, const half* embed_table, const int* tokens, int G
+) {
+    int g = blockIdx.x;
+    if (g >= G) return;
+    int token = tokens[g];
+    for (int d = threadIdx.x; d < qwen3::HIDDEN_SIZE; d += blockDim.x)
+        hidden[d + g * qwen3::HIDDEN_SIZE] = embed_table[token * qwen3::HIDDEN_SIZE + d];
+}
+
+// Batched RMSNorm: (dim, G) -> (dim, G), weight is (dim,)
+__global__ void rms_norm_batch_kernel(
+    half* out, const half* in, const half* weight, int dim, int G, float eps
+) {
+    int g = blockIdx.x;
+    if (g >= G) return;
+    const half* x = in + g * dim;
+    half* y = out + g * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = __half2float(x[i]);
+        sum_sq += v * v;
+    }
+    // Block reduction
+    for (int off = warpSize/2; off > 0; off /= 2)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, off);
+    __shared__ float s[32];
+    int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
+    if (lid == 0) s[wid] = sum_sq;
+    __syncthreads();
+    if (wid == 0) {
+        sum_sq = (lid < (blockDim.x+31)/32) ? s[lid] : 0.0f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, off);
+        if (lid == 0) s[0] = sum_sq;
+    }
+    __syncthreads();
+    float rms = rsqrtf(s[0] / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        y[i] = __float2half(__half2float(x[i]) * rms * __half2float(weight[i]));
+}
+
+// Batched copy: src (dim, G) -> dst (dim, G)
+__global__ void copy_batch_kernel(half* dst, const half* src, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) dst[idx] = src[idx];
+}
+
+// Batched residual add: out (dim, G) += residual (dim, G)
+__global__ void residual_add_batch_kernel(half* out, const half* res, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        float a = __half2float(out[idx]);
+        float b = __half2float(res[idx]);
+        out[idx] = __float2half(a + b);
+    }
+}
+
+// Batched QKNorm: apply per-head RMSNorm to Q (Q_DIM, G) and K (KV_DIM, G)
+__global__ void qk_norm_batch_kernel(
+    half* q, half* k, const half* q_w, const half* k_w,
+    int num_q, int num_kv, int head_dim, int G, float eps
+) {
+    int block_id = blockIdx.x;  // over total_heads * G
+    int g = block_id / (num_q + num_kv);
+    int head_in_block = block_id % (num_q + num_kv);
+    if (g >= G) return;
+
+    bool is_q = head_in_block < num_q;
+    int head_idx = is_q ? head_in_block : (head_in_block - num_q);
+    int dim_total = is_q ? qwen3::Q_DIM : qwen3::KV_DIM;
+    half* data = is_q ? (q + g * dim_total + head_idx * head_dim)
+                      : (k + g * dim_total + head_idx * head_dim);
+    const half* w = is_q ? q_w : k_w;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = __half2float(data[i]);
+        sum_sq += v * v;
+    }
+    for (int off = warpSize/2; off > 0; off /= 2)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, off);
+    __shared__ float s_val;
+    if (threadIdx.x == 0) s_val = sum_sq;
+    __syncthreads();
+    float rms = rsqrtf(s_val / head_dim + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        data[i] = __float2half(__half2float(data[i]) * rms * __half2float(w[i]));
+}
+
+// Batched RoPE: apply to Q (Q_DIM, G) and K (KV_DIM, G) with positions[G]
+__global__ void rope_batch_kernel(
+    half* q, half* k, const half* cos_table, const half* sin_table,
+    const int* positions, int max_seq_len, int G
+) {
+    int g = blockIdx.x;
+    if (g >= G) return;
+    int pos = positions[g];
+    int half_dim = qwen3::HEAD_DIM / 2;
+
+    // Apply to all Q heads
+    for (int h = 0; h < qwen3::NUM_HEADS; h++) {
+        half* qh = q + g * qwen3::Q_DIM + h * qwen3::HEAD_DIM;
+        for (int d = threadIdx.x; d < half_dim; d += blockDim.x) {
+            float c = __half2float(cos_table[pos * half_dim + d]);
+            float s_val = __half2float(sin_table[pos * half_dim + d]);
+            float q0 = __half2float(qh[d]);
+            float q1 = __half2float(qh[d + half_dim]);
+            qh[d] = __float2half(q0 * c - q1 * s_val);
+            qh[d + half_dim] = __float2half(q0 * s_val + q1 * c);
+        }
+    }
+    // Apply to all KV heads
+    for (int h = 0; h < qwen3::NUM_KV_HEADS; h++) {
+        half* kh = k + g * qwen3::KV_DIM + h * qwen3::HEAD_DIM;
+        for (int d = threadIdx.x; d < half_dim; d += blockDim.x) {
+            float c = __half2float(cos_table[pos * half_dim + d]);
+            float s_val = __half2float(sin_table[pos * half_dim + d]);
+            float k0 = __half2float(kh[d]);
+            float k1 = __half2float(kh[d + half_dim]);
+            kh[d] = __float2half(k0 * c - k1 * s_val);
+            kh[d + half_dim] = __float2half(k0 * s_val + k1 * c);
+        }
+    }
+}
+
+// Batched KV cache write: K (KV_DIM, G), V (KV_DIM, G) -> cache at positions[G]
+__global__ void kv_cache_write_batch_kernel(
+    half* cache_k, half* cache_v, const half* k, const half* v,
+    const int* positions, int max_seq_len, int G
+) {
+    int g = blockIdx.x;
+    if (g >= G) return;
+    int pos = positions[g];
+    for (int d = threadIdx.x; d < qwen3::KV_DIM; d += blockDim.x) {
+        int src = d + g * qwen3::KV_DIM;
+        int dst = (g * max_seq_len + pos) * qwen3::KV_DIM + d;
+        cache_k[dst] = k[src];
+        cache_v[dst] = v[src];
+    }
+}
+
+// Batched GQA attention: Q (Q_DIM, G) x KV_cache -> attn_out (Q_DIM, G)
+// One block per (g, head) pair
+__global__ void gqa_attention_batch_kernel(
+    half* out, const half* q, const half* cache_k, const half* cache_v,
+    float* attn_scratch, const int* positions,
+    int max_seq_len, int G
+) {
+    int g = blockIdx.x;
+    int head = blockIdx.y;
+    if (g >= G || head >= qwen3::NUM_HEADS) return;
+
+    int pos = positions[g];
+    int kv_head = head / qwen3::GQA_GROUPS;
+    float scale = rsqrtf((float)qwen3::HEAD_DIM);
+
+    const half* qh = q + g * qwen3::Q_DIM + head * qwen3::HEAD_DIM;
+    float* scores = attn_scratch + (g * qwen3::NUM_HEADS + head) * max_seq_len;
+
+    // Score computation
+    float max_score = -1e30f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        const half* kp = cache_k + (g * max_seq_len + p) * qwen3::KV_DIM + kv_head * qwen3::HEAD_DIM;
+        float dot = 0.0f;
+        for (int d = 0; d < qwen3::HEAD_DIM; d++)
+            dot += __half2float(qh[d]) * __half2float(kp[d]);
+        dot *= scale;
+        scores[p] = dot;
+        max_score = fmaxf(max_score, dot);
+    }
+
+    // Reduce max
+    for (int off = warpSize/2; off > 0; off /= 2)
+        max_score = fmaxf(max_score, __shfl_down_sync(0xFFFFFFFF, max_score, off));
+    __shared__ float s_max[32];
+    int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
+    if (lid == 0) s_max[wid] = max_score;
+    __syncthreads();
+    if (wid == 0) {
+        max_score = (lid < (blockDim.x+31)/32) ? s_max[lid] : -1e30f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            max_score = fmaxf(max_score, __shfl_down_sync(0xFFFFFFFF, max_score, off));
+        if (lid == 0) s_max[0] = max_score;
+    }
+    __syncthreads();
+    max_score = s_max[0];
+
+    // Softmax
+    float sum_exp = 0.0f;
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
+        float v = expf(scores[p] - max_score);
+        scores[p] = v;
+        sum_exp += v;
+    }
+    for (int off = warpSize/2; off > 0; off /= 2)
+        sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, off);
+    __shared__ float s_sum[32];
+    if (lid == 0) s_sum[wid] = sum_exp;
+    __syncthreads();
+    if (wid == 0) {
+        sum_exp = (lid < (blockDim.x+31)/32) ? s_sum[lid] : 0.0f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            sum_exp += __shfl_down_sync(0xFFFFFFFF, sum_exp, off);
+        if (lid == 0) s_sum[0] = sum_exp;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / (s_sum[0] + 1e-8f);
+    for (int p = threadIdx.x; p <= pos; p += blockDim.x)
+        scores[p] *= inv_sum;
+    __syncthreads();
+
+    // Weighted sum of V
+    half* oh = out + g * qwen3::Q_DIM + head * qwen3::HEAD_DIM;
+    for (int d = threadIdx.x; d < qwen3::HEAD_DIM; d += blockDim.x) {
+        float val = 0.0f;
+        for (int p = 0; p <= pos; p++)
+            val += scores[p] * __half2float(cache_v[(g * max_seq_len + p) * qwen3::KV_DIM + kv_head * qwen3::HEAD_DIM + d]);
+        oh[d] = __float2half(val);
+    }
+}
+
+// Batched SiLU gate mul: gate (dim, G) = SiLU(gate) * up
+__global__ void silu_mul_batch_kernel(half* gate, const half* up, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        float g = __half2float(gate[idx]);
+        float u = __half2float(up[idx]);
+        gate[idx] = __float2half((g / (1.0f + expf(-g))) * u);
+    }
+}
+
+// Batched argmax sampling: logits (VOCAB_SIZE, G) -> tokens[G]
+__global__ void argmax_batch_kernel(const float* logits, int* tokens, int vocab, int G) {
+    int g = blockIdx.x;
+    if (g >= G) return;
+    const float* col = logits + g * vocab;
+    float best = -1e30f;
+    int best_idx = 0;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        if (col[i] > best) { best = col[i]; best_idx = i; }
+    }
+    // Warp reduce
+    for (int off = warpSize/2; off > 0; off /= 2) {
+        float other = __shfl_down_sync(0xFFFFFFFF, best, off);
+        int other_idx = __shfl_down_sync(0xFFFFFFFF, best_idx, off);
+        if (other > best) { best = other; best_idx = other_idx; }
+    }
+    __shared__ float s_best[32];
+    __shared__ int s_idx[32];
+    int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
+    if (lid == 0) { s_best[wid] = best; s_idx[wid] = best_idx; }
+    __syncthreads();
+    if (wid == 0) {
+        best = (lid < (blockDim.x+31)/32) ? s_best[lid] : -1e30f;
+        best_idx = (lid < (blockDim.x+31)/32) ? s_idx[lid] : 0;
+        for (int off = warpSize/2; off > 0; off /= 2) {
+            float other = __shfl_down_sync(0xFFFFFFFF, best, off);
+            int other_idx = __shfl_down_sync(0xFFFFFFFF, best_idx, off);
+            if (other > best) { best = other; best_idx = other_idx; }
+        }
+        if (lid == 0) tokens[g] = best_idx;
+    }
+}
+
+// Launch wrappers for batch kernels
+void launch_embed_batch(half* h, const half* et, const int* tok, int G, cudaStream_t s) {
+    embed_batch_kernel<<<G, 256, 0, s>>>(h, et, tok, G);
+}
+void launch_rms_norm_batch(half* out, const half* in, const half* w, int dim, int G, float eps, cudaStream_t s) {
+    rms_norm_batch_kernel<<<G, 256, 0, s>>>(out, in, w, dim, G, eps);
+}
+void launch_copy_batch(half* dst, const half* src, int total, cudaStream_t s) {
+    copy_batch_kernel<<<(total+255)/256, 256, 0, s>>>(dst, src, total);
+}
+void launch_residual_add_batch(half* out, const half* res, int total, cudaStream_t s) {
+    residual_add_batch_kernel<<<(total+255)/256, 256, 0, s>>>(out, res, total);
+}
+void launch_qk_norm_batch(half* q, half* k, const half* qw, const half* kw, int nq, int nkv, int hd, int G, float eps, cudaStream_t s) {
+    qk_norm_batch_kernel<<<G * (nq + nkv), 128, 0, s>>>(q, k, qw, kw, nq, nkv, hd, G, eps);
+}
+void launch_rope_batch(half* q, half* k, const half* ct, const half* st, const int* pos, int msl, int G, cudaStream_t s) {
+    rope_batch_kernel<<<G, 64, 0, s>>>(q, k, ct, st, pos, msl, G);
+}
+void launch_kv_cache_write_batch(half* ck, half* cv, const half* k, const half* v, const int* pos, int msl, int G, cudaStream_t s) {
+    kv_cache_write_batch_kernel<<<G, 256, 0, s>>>(ck, cv, k, v, pos, msl, G);
+}
+void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, cudaStream_t s) {
+    dim3 grid(G, qwen3::NUM_HEADS);
+    gqa_attention_batch_kernel<<<grid, 128, 0, s>>>(out, q, ck, cv, as, pos, msl, G);
+}
+void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s) {
+    silu_mul_batch_kernel<<<(total+255)/256, 256, 0, s>>>(gate, up, total);
+}
+void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cudaStream_t s) {
+    argmax_batch_kernel<<<G, 256, 0, s>>>(logits, tokens, vocab, G);
+}
+
 // Convert fp16 array to fp32 (for NF4 LM head → fp32 logits)
 __global__ void fp16_to_fp32_kernel(const half* input, float* output, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

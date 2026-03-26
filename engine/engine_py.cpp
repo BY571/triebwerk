@@ -81,6 +81,14 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("token_ids"),
              "Process prompt tokens (prefill phase)")
 
+        .def("generate_batch", &InferenceEngine::generate_batch,
+             py::arg("prompts"),
+             py::arg("max_new_tokens") = 512,
+             py::arg("temperature") = 1.0f,
+             py::arg("top_p") = 0.9f,
+             py::arg("eos_token_id") = -1,
+             "Generate from G prompts in parallel (GEMM, tensor cores).")
+
         .def("profile_decode", [](InferenceEngine& self, int token_id) {
                  auto result = self.profile_decode(token_id);
                  py::dict d;
