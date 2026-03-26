@@ -1045,12 +1045,11 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
     project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
 
-    if (debug_mode && layer_idx == 0) {
+    if (layer_idx == 0) {
         cudaDeviceSynchronize();
-        fprintf(stderr, "[BATCH L0] After QKV projection:\n");
-        dump_half("q_buf[0:8]", B->q_buf, 8);
-        dump_half("k_buf[0:8]", B->k_buf, 8);
-        dump_half("norm_buf[0:8]", B->norm_buf, 8);
+        fprintf(stderr, "[B] L0 norm: "); dump_half("n", B->norm_buf, 8);
+        fprintf(stderr, "[B] L0 q: "); dump_half("q", B->q_buf, 8);
+        fprintf(stderr, "[B] L0 k: "); dump_half("k", B->k_buf, 8);
     }
 
     // 3. QKNorm + RoPE
@@ -1096,16 +1095,17 @@ void InferenceEngine::decode_batch(int G) {
     // Embedding
     launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, stream);
 
-    if (debug_mode) {
+    // Always debug first batch token
+    {
         cudaDeviceSynchronize();
-        fprintf(stderr, "[BATCH] After embedding:\n");
-        dump_half("hidden[0:8]", B->hidden, 8);
-        debug_mode = 0;  // only debug first token
+        fprintf(stderr, "[B] embed: "); dump_half("h", B->hidden, 8);
     }
 
     // Forward layers
     for (int i = 0; i < NUM_LAYERS; i++)
         forward_layer_batch(i, G, stream);
+
+    { cudaDeviceSynchronize(); fprintf(stderr, "[B] after layers: "); dump_half("h", B->hidden, 8); }
 
     // Final norm
     launch_rms_norm_batch(B->norm_buf, B->hidden, weights_.final_layernorm,
