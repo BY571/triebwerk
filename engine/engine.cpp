@@ -284,7 +284,7 @@ void InferenceEngine::forward_layer(int layer_idx) {
 
     if (batch_debug && i == 0) {
         cudaDeviceSynchronize();
-        printf("[SINGLE L0] After norm:\n");
+        fprintf(stderr, "[SINGLE L0] After norm:\n");
         dump_half("norm_out[0:8]", norm_out, 8);
         dump_half("hidden[0:8]", state_.hidden, 8);
     }
@@ -311,7 +311,7 @@ void InferenceEngine::forward_layer(int layer_idx) {
 
     if (batch_debug && layer_idx == 0) {
         cudaDeviceSynchronize();
-        printf("[SINGLE L0] After QKV projection:\n");
+        fprintf(stderr, "[SINGLE L0] After QKV projection:\n");
         dump_half("q_buf[0:8]", state_.q_buf, 8);
         dump_half("k_buf[0:8]", state_.k_buf, 8);
     }
@@ -1040,7 +1040,7 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
 
     if (batch_debug && layer_idx == 0) {
         cudaDeviceSynchronize();
-        printf("[BATCH L0] After QKV projection:\n");
+        fprintf(stderr, "[BATCH L0] After QKV projection:\n");
         dump_half("q_buf[0:8]", B->q_buf, 8);
         dump_half("k_buf[0:8]", B->k_buf, 8);
         dump_half("norm_buf[0:8]", B->norm_buf, 8);
@@ -1085,10 +1085,11 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
 static void dump_half(const char* label, const half* d, int n, int stride=0) {
     std::vector<half> h(n);
     cudaMemcpy(h.data(), d, n * sizeof(half), cudaMemcpyDeviceToHost);
-    printf("  %s:", label);
+    fprintf(stderr, "  %s:", label);
     for (int i = 0; i < std::min(n, 8); i++)
-        printf(" %.4f", __half2float(h[stride ? i * stride : i]));
-    printf("\n");
+        fprintf(stderr, " %.4f", __half2float(h[stride ? i * stride : i]));
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 static void dump_float(const char* label, const float* d, int n) {
@@ -1110,7 +1111,7 @@ void InferenceEngine::decode_batch(int G) {
 
     if (batch_debug) {
         cudaDeviceSynchronize();
-        printf("[BATCH] After embedding:\n");
+        fprintf(stderr, "[BATCH] After embedding:\n");
         dump_half("hidden[0:8]", B->hidden, 8);
         batch_debug = 0;  // only debug first token
     }
