@@ -22,3 +22,4 @@ wandb/
 # Project-local docs
 CLAUDE.md
 knowledge_base/
+engine/build_local/

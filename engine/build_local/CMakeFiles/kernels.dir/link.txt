@@ -1,2 +1,0 @@
-/usr/bin/ar qc libkernels.a CMakeFiles/kernels.dir/kernels.cu.o CMakeFiles/kernels.dir/nf4_gemv_fast.cu.o
-/usr/bin/ranlib libkernels.a
