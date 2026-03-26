@@ -276,13 +276,20 @@ void InferenceEngine::forward_layer(int layer_idx) {
     auto& kv = state_.kv_cache[layer_idx];
     cudaStream_t stream = 0; // default stream
 
-    // 1. Input LayerNorm: copy hidden → residual AND normalize → norm_out (1 kernel)
+    // 1. Input LayerNorm
     half* norm_out = state_.ffn_out;
     launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // Quantize input to int8 for dp4a (shared by QKV projections)
+    if (batch_debug && i == 0) {
+        cudaDeviceSynchronize();
+        printf("[SINGLE L0] After norm:\n");
+        dump_half("norm_out[0:8]", norm_out, 8);
+        dump_half("hidden[0:8]", state_.hidden, 8);
+    }
+
+    // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
         launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
                                  state_.q8_sums, HIDDEN_SIZE, stream);
@@ -302,7 +309,14 @@ void InferenceEngine::forward_layer(int layer_idx) {
         else { auto& w = layer.v_proj_nf4; GEMV_4BIT(w, norm_out, state_.v_buf, stream); }
     }
 
-    // 2b. Fused QKNorm (one kernel for all 24 heads instead of 24 separate launches)
+    if (batch_debug && layer_idx == 0) {
+        cudaDeviceSynchronize();
+        printf("[SINGLE L0] After QKV projection:\n");
+        dump_half("q_buf[0:8]", state_.q_buf, 8);
+        dump_half("k_buf[0:8]", state_.k_buf, 8);
+    }
+
+    // 2b. Fused QKNorm
     launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm,
                    NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, RMS_NORM_EPS, stream);
 
@@ -1024,6 +1038,14 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
     project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
 
+    if (batch_debug && layer_idx == 0) {
+        cudaDeviceSynchronize();
+        printf("[BATCH L0] After QKV projection:\n");
+        dump_half("q_buf[0:8]", B->q_buf, 8);
+        dump_half("k_buf[0:8]", B->k_buf, 8);
+        dump_half("norm_buf[0:8]", B->norm_buf, 8);
+    }
+
     // 3. QKNorm + RoPE
     launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
                          NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, G, RMS_NORM_EPS, stream);
@@ -1060,12 +1082,38 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
 }
 
+static void dump_half(const char* label, const half* d, int n, int stride=0) {
+    std::vector<half> h(n);
+    cudaMemcpy(h.data(), d, n * sizeof(half), cudaMemcpyDeviceToHost);
+    printf("  %s:", label);
+    for (int i = 0; i < std::min(n, 8); i++)
+        printf(" %.4f", __half2float(h[stride ? i * stride : i]));
+    printf("\n");
+}
+
+static void dump_float(const char* label, const float* d, int n) {
+    std::vector<float> h(n);
+    cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("  %s:", label);
+    for (int i = 0; i < std::min(n, 8); i++) printf(" %.4f", h[i]);
+    printf("\n");
+}
+
+static int batch_debug = 1;
+
 void InferenceEngine::decode_batch(int G) {
     cudaStream_t stream = 0;
     auto* B = batch_;
 
     // Embedding
     launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, stream);
+
+    if (batch_debug) {
+        cudaDeviceSynchronize();
+        printf("[BATCH] After embedding:\n");
+        dump_half("hidden[0:8]", B->hidden, 8);
+        batch_debug = 0;  // only debug first token
+    }
 
     // Forward layers
     for (int i = 0; i < NUM_LAYERS; i++)

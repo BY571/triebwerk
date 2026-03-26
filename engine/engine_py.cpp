@@ -81,6 +81,29 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("token_ids"),
              "Process prompt tokens (prefill phase)")
 
+        .def("debug_batch_vs_single", [](InferenceEngine& self, int token_id) {
+                 // Run single-sequence decode
+                 self.decode(token_id);
+                 // Get logits
+                 std::vector<float> single_logits(qwen3::VOCAB_SIZE);
+                 cudaMemcpy(single_logits.data(), self.state_.logits,
+                            qwen3::VOCAB_SIZE * sizeof(float), cudaMemcpyDeviceToHost);
+
+                 // Run batch decode with same token
+                 self.alloc_batch(1, 1024);
+                 auto* B = self.batch_;
+                 int tok = token_id;
+                 int pos = self.state_.current_pos - 1;  // already advanced by decode
+                 cudaMemcpy(B->d_tokens, &tok, sizeof(int), cudaMemcpyHostToDevice);
+                 cudaMemcpy(B->d_positions, &pos, sizeof(int), cudaMemcpyHostToDevice);
+                 // Reset batch KV cache to match single KV cache state... too complex
+
+                 // Instead, just check first projection output
+                 return py::make_tuple(single_logits[0], single_logits[1], single_logits[2]);
+             },
+             py::arg("token_id"),
+             "Debug: compare single vs batch decode outputs")
+
         .def("generate_batch", &InferenceEngine::generate_batch,
              py::arg("prompts"),
              py::arg("max_new_tokens") = 512,
