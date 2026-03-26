@@ -103,6 +103,8 @@ extern "C" {
     void launch_q4l_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_nf4_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_q4l_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
+    void launch_quantize_input_q8(const half* input, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, cudaStream_t stream);
+    void launch_q4l_dp4a_gemv(const uint8_t* w, const float* w_scales, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
@@ -123,9 +125,9 @@ extern "C" {
 
 using namespace qwen3;
 
-// Dispatch macros: use Q4L kernel when model uses Q4 Linear format
+// Dispatch macros: use dp4a for Q4L, fallback to fp32 FMA for NF4
 #define GEMV_4BIT(w, in, out, stream) \
-    do { if (weights_.is_q4l) launch_q4l_gemv((w).data, (w).absmax, (in), (out), (w).out_dim, (w).in_dim, (w).block_size, (stream)); \
+    do { if (weights_.is_q4l) launch_q4l_dp4a_gemv((w).data, (w).absmax, state_.q8_data, state_.q8_scales, state_.q8_sums, (out), (w).out_dim, (w).in_dim, (stream)); \
          else launch_nf4_gemv_fast((w).data, (w).absmax, (in), (out), (w).out_dim, (w).in_dim, (w).block_size, (stream)); } while(0)
 #define FUSED2_4BIT(aw, ay, bw, by, x, id, stream) \
     do { if (weights_.is_q4l) launch_q4l_fused_2((aw).data, (aw).absmax, (ay), (aw).out_dim, (bw).data, (bw).absmax, (by), (bw).out_dim, (x), (id), (stream)); \
@@ -171,6 +173,13 @@ InferenceEngine::InferenceEngine(int max_seq_len) {
 
     // NF4 LM head temp buffer (allocated upfront, ~304KB)
     cudaMallocTyped(&state_.lm_head_fp16_buf, VOCAB_SIZE * sizeof(half));
+
+    // dp4a input quantization buffers
+    int max_q8_dim = INTERMEDIATE_SIZE; // largest input dimension
+    int max_q8_blocks = max_q8_dim / 64;
+    cudaMallocTyped(&state_.q8_data, max_q8_dim * sizeof(int8_t));
+    cudaMallocTyped(&state_.q8_scales, max_q8_blocks * sizeof(float));
+    cudaMallocTyped(&state_.q8_sums, max_q8_blocks * sizeof(float));
 
     // LoRA scratch
     cudaMallocTyped(&state_.lora_scratch, 64 * sizeof(half)); // max rank 64
@@ -259,8 +268,15 @@ void InferenceEngine::forward_layer(int layer_idx) {
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // 2. QKV projections — fused when all 3 are quantized (1 launch instead of 3)
-    if (!layer.q_proj_fp16 && !layer.k_proj_fp16 && !layer.v_proj_fp16) {
+    // Quantize input to int8 for dp4a (shared by QKV projections)
+    if (weights_.is_q4l) {
+        launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
+                                 state_.q8_sums, HIDDEN_SIZE, stream);
+    }
+
+    // 2. QKV projections
+    if (!layer.q_proj_fp16 && !layer.k_proj_fp16 && !layer.v_proj_fp16 && !weights_.is_q4l) {
+        // Fused NF4 path (3→1 launch)
         auto& q = layer.q_proj_nf4; auto& k = layer.k_proj_nf4; auto& v = layer.v_proj_nf4;
         FUSED3_4BIT(q, state_.q_buf, k, state_.k_buf, v, state_.v_buf, norm_out, q.in_dim, stream);
     } else {
@@ -291,7 +307,11 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_gqa_attention(state_.q_buf, kv.key, kv.value, state_.attn_out,
                           state_.attn_scores, state_.current_pos, state_.max_seq_len, stream);
 
-    // 6. Output projection
+    // 6. Output projection (input: attn_out, dim=Q_DIM)
+    if (!layer.o_proj_fp16 && weights_.is_q4l) {
+        launch_quantize_input_q8(state_.attn_out, state_.q8_data, state_.q8_scales,
+                                 state_.q8_sums, Q_DIM, stream);
+    }
     if (layer.o_proj_fp16) cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
     else { auto& w = layer.o_proj_nf4; GEMV_4BIT(w, state_.attn_out, state_.hidden, stream); }
 
@@ -303,8 +323,14 @@ void InferenceEngine::forward_layer(int layer_idx) {
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // 9. FFN: fused gate+up when both quantized
-    if (!layer.gate_proj_fp16 && !layer.up_proj_fp16) {
+    // Quantize FFN input for dp4a (shared by gate+up+down)
+    if (weights_.is_q4l) {
+        launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
+                                 state_.q8_sums, HIDDEN_SIZE, stream);
+    }
+
+    // 9. FFN: fused gate+up when both quantized (NF4 fused, Q4L individual dp4a)
+    if (!layer.gate_proj_fp16 && !layer.up_proj_fp16 && !weights_.is_q4l) {
         auto& g = layer.gate_proj_nf4; auto& u = layer.up_proj_nf4;
         FUSED2_4BIT(g, state_.gate_buf, u, state_.up_buf, norm_out, g.in_dim, stream);
     } else {
@@ -314,6 +340,11 @@ void InferenceEngine::forward_layer(int layer_idx) {
         else { auto& w = layer.up_proj_nf4; GEMV_4BIT(w, norm_out, state_.up_buf, stream); }
     }
     launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
+    // Quantize SiLU output for down projection dp4a (dim=INTERMEDIATE_SIZE)
+    if (!layer.down_proj_fp16 && weights_.is_q4l) {
+        launch_quantize_input_q8(state_.gate_buf, state_.q8_data, state_.q8_scales,
+                                 state_.q8_sums, INTERMEDIATE_SIZE, stream);
+    }
     if (layer.down_proj_fp16) cublas_hgemv_lora(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, layer.lora_down, state_.lora_scratch);
     else { auto& w = layer.down_proj_nf4; GEMV_4BIT(w, state_.gate_buf, state_.hidden, stream); }
 

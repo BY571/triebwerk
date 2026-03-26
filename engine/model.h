@@ -156,6 +156,11 @@ struct InferenceState {
     // NF4 LM head temp buffer (fp16 output before fp32 conversion)
     half* lm_head_fp16_buf; // (VOCAB_SIZE,) — allocated if NF4 LM head loaded
 
+    // dp4a input quantization buffers (for Q4L dp4a GEMV)
+    int8_t* q8_data;        // (INTERMEDIATE_SIZE,) quantized input
+    float* q8_scales;       // (INTERMEDIATE_SIZE/64,) per-block scale
+    float* q8_sums;         // (INTERMEDIATE_SIZE/64,) per-block sum of q8 values
+
     // LoRA scratch buffer (for A @ x intermediate, max rank = 64)
     half* lora_scratch; // (max_lora_rank,)
 
