@@ -1,6 +1,6 @@
 """Benchmark NF4 weights vs fp16 weights."""
 import sys, os, time, torch
-sys.path.insert(0, "engine/build")
+sys.path.insert(0, os.environ.get("ENGINE_BUILD", "engine/build2"))
 import jetson_engine
 from transformers import AutoTokenizer
 
