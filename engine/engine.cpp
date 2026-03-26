@@ -118,6 +118,7 @@ extern "C" {
     void launch_gqa_attention_batch(half* out, const half* q, const half* ck, const half* cv, float* as, const int* pos, int msl, int G, cudaStream_t s);
     void launch_silu_mul_batch(half* gate, const half* up, int total, cudaStream_t s);
     void launch_argmax_batch(const float* logits, int* tokens, int vocab, int G, cudaStream_t s);
+    void launch_sample_batch(float* logits, int* tokens, const float* randoms, int vocab, int G, float temperature, float top_p, cudaStream_t s);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
@@ -1003,6 +1004,8 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->h_tokens = new int[G]();
     cudaMalloc(&batch_->d_tokens, G * sizeof(int));
     batch_->h_finished = new bool[G]();
+    batch_->h_randoms = new float[G]();
+    cudaMalloc(&batch_->d_randoms, G * sizeof(float));
 
     std::cout << "  Batch allocated: G=" << G << " max_seq=" << max_seq_len
               << " KV=" << (G * max_seq_len * KV_DIM * 2 * NUM_LAYERS * 2 / 1e6) << "MB" << std::endl;
@@ -1160,8 +1163,18 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     // Phase 2: Decode (generate new tokens)
     for (int step = 0; step < max_new_tokens; step++) {
-        // Sample from logits
-        launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, 0);
+        // Sample from logits (temperature + top-p, or greedy)
+        if (temperature < 0.01f) {
+            launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, 0);
+        } else {
+            // Generate G random values on CPU (fast enough for small G)
+            static std::mt19937 batch_rng(42);
+            std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+            for (int g = 0; g < G; g++) B->h_randoms[g] = dist(batch_rng);
+            cudaMemcpy(B->d_randoms, B->h_randoms, G * sizeof(float), cudaMemcpyHostToDevice);
+            launch_sample_batch(B->logits, B->d_tokens, B->d_randoms,
+                                VOCAB_SIZE, G, temperature, top_p, 0);
+        }
         cudaMemcpy(B->h_tokens, B->d_tokens, G * sizeof(int), cudaMemcpyDeviceToHost);
 
         // Check stopping

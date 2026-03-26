@@ -1304,6 +1304,84 @@ __global__ void argmax_batch_kernel(const float* logits, int* tokens, int vocab,
     }
 }
 
+// Batched temperature + top-p sampling: one block per sequence
+__global__ void sample_batch_kernel(
+    float* __restrict__ logits,   // (VOCAB_SIZE, G) column-major, modified in-place
+    int* __restrict__ tokens,     // (G,) output token ids
+    const float* __restrict__ randoms, // (G,) uniform random values [0,1)
+    int vocab, int G,
+    float temperature, float top_p
+) {
+    int g = blockIdx.x;
+    if (g >= G) return;
+    float* col = logits + (size_t)g * vocab;
+    int wid = threadIdx.x / warpSize, lid = threadIdx.x % warpSize;
+    int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+
+    // Step 1: temperature + find max
+    float local_max = -1e30f;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        col[i] /= temperature;
+        if (col[i] > local_max) local_max = col[i];
+    }
+    for (int off = warpSize/2; off > 0; off /= 2)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, off));
+    __shared__ float s_max[32];
+    if (lid == 0) s_max[wid] = local_max;
+    __syncthreads();
+    if (wid == 0) {
+        local_max = (lid < n_warps) ? s_max[lid] : -1e30f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, off));
+        if (lid == 0) s_max[0] = local_max;
+    }
+    __syncthreads();
+    float max_val = s_max[0];
+
+    // Step 2: exp + sum
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+        float v = expf(col[i] - max_val);
+        col[i] = v;
+        local_sum += v;
+    }
+    for (int off = warpSize/2; off > 0; off /= 2)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);
+    __shared__ float s_sum[32];
+    if (lid == 0) s_sum[wid] = local_sum;
+    __syncthreads();
+    if (wid == 0) {
+        local_sum = (lid < n_warps) ? s_sum[lid] : 0.0f;
+        for (int off = warpSize/2; off > 0; off /= 2)
+            local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, off);
+        if (lid == 0) s_sum[0] = local_sum;
+    }
+    __syncthreads();
+
+    // Step 3: normalize
+    float inv_sum = 1.0f / s_sum[0];
+    for (int i = threadIdx.x; i < vocab; i += blockDim.x)
+        col[i] *= inv_sum;
+    __syncthreads();
+
+    // Step 4: cumulative sum sampling (thread 0 only)
+    if (threadIdx.x == 0) {
+        float threshold = randoms[g];
+        if (top_p < 1.0f) threshold *= top_p;
+        float cum = 0.0f;
+        for (int i = 0; i < vocab; i++) {
+            cum += col[i];
+            if (cum >= threshold) { tokens[g] = i; return; }
+        }
+        tokens[g] = vocab - 1;
+    }
+}
+
+void launch_sample_batch(float* logits, int* tokens, const float* randoms,
+                         int vocab, int G, float temperature, float top_p, cudaStream_t s) {
+    sample_batch_kernel<<<G, 256, 0, s>>>(logits, tokens, randoms, vocab, G, temperature, top_p);
+}
+
 // Launch wrappers for batch kernels
 void launch_embed_batch(half* h, const half* et, const int* tok, int G, cudaStream_t s) {
     embed_batch_kernel<<<G, 256, 0, s>>>(h, et, tok, G);

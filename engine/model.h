@@ -202,6 +202,8 @@ struct BatchState {
     int* h_tokens;      // host (G,) sampled tokens
     int* d_tokens;      // device (G,)
     bool* h_finished;   // host (G,)
+    float* h_randoms;   // host (G,) for stochastic sampling
+    float* d_randoms;   // device (G,)
 };
 
 // Top-level engine
