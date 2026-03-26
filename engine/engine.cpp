@@ -357,15 +357,8 @@ void InferenceEngine::decode(int token_id) {
     launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    // LM head -> fp32 logits
-    if (weights_.has_nf4_lm_head) {
-        // NF4 LM head: GEMV to fp16, then convert to fp32
-        auto& w = weights_.lm_head_nf4;
-        launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.lm_head_fp16_buf,
-                             w.out_dim, w.in_dim, w.block_size, stream);
-        launch_fp16_to_fp32(state_.lm_head_fp16_buf, state_.logits, VOCAB_SIZE, stream);
-    } else {
-        // fp16 cuBLAS (tied to embedding)
+    // LM head -> fp32 logits (always cuBLAS fp16: 3.1ms vs 6.5ms for NF4)
+    {
         ensure_cublas();
         float alpha = 1.0f, beta = 0.0f;
         cublasGemmEx(cublas_handle,
@@ -482,17 +475,11 @@ std::vector<std::pair<std::string, float>> InferenceEngine::profile_decode(int t
     timed("final_norm", [&]{ launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream); });
 
     timed("lm_head", [&]{
-        if (weights_.has_nf4_lm_head) {
-            auto& w = weights_.lm_head_nf4;
-            launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.lm_head_fp16_buf, w.out_dim, w.in_dim, w.block_size, stream);
-            launch_fp16_to_fp32(state_.lm_head_fp16_buf, state_.logits, VOCAB_SIZE, stream);
-        } else {
-            ensure_cublas();
-            float alpha = 1.0f, beta = 0.0f;
-            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
-                         weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE, norm_out, CUDA_R_16F, HIDDEN_SIZE,
-                         &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        }
+        ensure_cublas();
+        float alpha = 1.0f, beta = 0.0f;
+        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
+                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE, norm_out, CUDA_R_16F, HIDDEN_SIZE,
+                     &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     });
 
     state_.current_pos++;
@@ -634,22 +621,15 @@ void InferenceEngine::enable_cuda_graph() {
     launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, graph_stream_);
 
-    // LM head helper for graph warmup + capture
+    // LM head: always cuBLAS fp16 (2x faster than NF4 GEMV for this large matrix)
     auto lm_head_on_stream = [&](cudaStream_t s) {
-        if (weights_.has_nf4_lm_head) {
-            auto& w = weights_.lm_head_nf4;
-            launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.lm_head_fp16_buf,
-                                 w.out_dim, w.in_dim, w.block_size, s);
-            launch_fp16_to_fp32(state_.lm_head_fp16_buf, state_.logits, VOCAB_SIZE, s);
-        } else {
-            float alpha = 1.0f, beta = 0.0f;
-            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                         VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
-                         weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
-                         norm_out, CUDA_R_16F, HIDDEN_SIZE,
-                         &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE,
-                         CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-        }
+        float alpha = 1.0f, beta = 0.0f;
+        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
+                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
+                     norm_out, CUDA_R_16F, HIDDEN_SIZE,
+                     &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE,
+                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     };
 
     lm_head_on_stream(graph_stream_);
