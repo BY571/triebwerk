@@ -7,11 +7,12 @@ The rollout function:
 
 TRL then handles the correct GRPO loss (clipped surrogate, advantage normalization).
 """
+import os
 import sys
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, "engine/build")
+sys.path.insert(0, os.environ.get("ENGINE_BUILD", "engine/build2"))
 import jetson_engine
 
 

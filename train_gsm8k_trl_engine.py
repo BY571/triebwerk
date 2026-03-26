@@ -27,7 +27,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
-sys.path.insert(0, "engine/build")
+sys.path.insert(0, os.environ.get("ENGINE_BUILD", "engine/build2"))
 import jetson_engine
 
 from jetson_compat import patch_amp_for_jetson, cast_model_to_fp16
@@ -118,7 +118,8 @@ def main():
     # ── C++ Engine ──
     print("\nLoading C++ engine...")
     engine = jetson_engine.Engine(1024)
-    engine.load_weights("engine/weights")
+    weights_path = os.environ.get("ENGINE_WEIGHTS", "engine/weights_q4l")
+    engine.load_weights(weights_path)
 
     # ── PyTorch model ──
     print(f"\nLoading PyTorch model ({args.model})...")
