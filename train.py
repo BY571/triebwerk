@@ -365,17 +365,26 @@ def train(args):
     scaler = torch.amp.GradScaler("cuda")
     device = next(model.parameters()).device
 
-    # ── Dataset ──
-    print("\nLoading GSM8K...")
-    dataset = get_gsm8k_dataset()
+    # ── Dataset & rewards ──
+    if hasattr(args, "_dataset") and args._dataset is not None:
+        dataset = args._dataset
+        reward_funcs = args._reward_funcs
+        stop_texts = args._stop_texts or []
+    else:
+        print("\nLoading GSM8K...")
+        dataset = get_gsm8k_dataset()
+        reward_funcs = [format_reward, correctness_reward]
+        stop_texts = ["</answer>"]
     dataset_iter = iter(dataset)
 
-    reward_funcs = [format_reward, correctness_reward]
-    stop_ids = tokenizer.encode("</answer>", add_special_tokens=False)
+    stop_ids = []
+    for text in stop_texts:
+        stop_ids.extend(tokenizer.encode(text, add_special_tokens=False))
     warmup_steps = int(args.max_steps * args.warmup_ratio)
 
     # ── Save config ──
-    config_dict = vars(args).copy()
+    config_dict = {k: v for k, v in vars(args).items()
+                   if not k.startswith("_") and isinstance(v, (int, float, str, bool, type(None)))}
     config_dict["run_id"] = run_id
     config_dict["trainable_params"] = trainable
     config_dict["total_params"] = total
@@ -537,6 +546,74 @@ def train(args):
     print(f"  LoRA: {final_path}")
     print(f"  Metrics: {run_dir}/metrics.json")
     print(f"{'=' * 60}")
+
+
+def grpo_train(
+    dataset,
+    reward_funcs,
+    model="Qwen/Qwen3-0.6B",
+    max_steps=300,
+    num_generations=4,
+    max_completion_tokens=512,
+    lr=5e-6,
+    lora_rank=16,
+    loss_type="dapo",
+    output_dir="./checkpoints_engine",
+    dry_run=False,
+    stop_texts=None,
+    **kwargs,
+):
+    """High-level GRPO training API.
+
+    Args:
+        dataset: HuggingFace dataset with "prompt" and "answer" columns.
+            "prompt" is either a string or list of message dicts.
+            "answer" is passed to reward functions as a keyword arg.
+        reward_funcs: List of callables (completions, **kwargs) -> list[float].
+            Each receives decoded completion strings and any extra columns.
+        model: HuggingFace model name (loaded with 4-bit quantization).
+        max_steps: Number of GRPO training steps.
+        num_generations: Completions per prompt (G).
+        max_completion_tokens: Max tokens per completion.
+        lr: Learning rate.
+        lora_rank: LoRA adapter rank.
+        loss_type: "dapo" or "grpo".
+        output_dir: Where to save checkpoints.
+        dry_run: Use HF generate instead of C++ engine.
+        stop_texts: List of strings to stop generation (e.g. ["</answer>"]).
+        **kwargs: Additional args (epsilon, temperature, top_p, etc.)
+
+    Returns:
+        Path to final LoRA adapter directory.
+    """
+    args = argparse.Namespace(
+        model=model,
+        max_steps=max_steps,
+        num_generations=num_generations,
+        max_completion_tokens=max_completion_tokens,
+        lr=lr,
+        lora_rank=lora_rank,
+        loss_type=loss_type,
+        output_dir=output_dir,
+        dry_run=dry_run,
+        epsilon=kwargs.get("epsilon", 0.2),
+        epsilon_high=kwargs.get("epsilon_high", kwargs.get("epsilon", 0.2)),
+        temperature=kwargs.get("temperature", 1.0),
+        top_p=kwargs.get("top_p", 0.9),
+        max_grad_norm=kwargs.get("max_grad_norm", 1.0),
+        warmup_ratio=kwargs.get("warmup_ratio", 0.1),
+        gradient_checkpointing=kwargs.get("gradient_checkpointing", True),
+        mask_truncated=kwargs.get("mask_truncated", True),
+        logging_steps=kwargs.get("logging_steps", 1),
+        save_steps=kwargs.get("save_steps", 100),
+    )
+
+    # Inject dataset and reward_funcs so train() can use them
+    args._dataset = dataset
+    args._reward_funcs = reward_funcs
+    args._stop_texts = stop_texts
+
+    train(args)
 
 
 def main():
