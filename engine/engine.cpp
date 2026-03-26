@@ -267,6 +267,24 @@ void InferenceEngine::reset() {
     }
 }
 
+// Debug helpers
+static void dump_half(const char* label, const half* d, int n) {
+    std::vector<half> h(n);
+    cudaMemcpy(h.data(), d, n * sizeof(half), cudaMemcpyDeviceToHost);
+    fprintf(stderr, "  %s:", label);
+    for (int i = 0; i < std::min(n, 8); i++)
+        fprintf(stderr, " %.4f", __half2float(h[i]));
+    fprintf(stderr, "\n"); fflush(stderr);
+}
+static void dump_float(const char* label, const float* d, int n) {
+    std::vector<float> h(n);
+    cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost);
+    fprintf(stderr, "  %s:", label);
+    for (int i = 0; i < std::min(n, 8); i++) fprintf(stderr, " %.4f", h[i]);
+    fprintf(stderr, "\n"); fflush(stderr);
+}
+static int debug_mode = 1;
+
 // ============================================================================
 // Forward pass through one transformer layer
 // ============================================================================
@@ -281,13 +299,6 @@ void InferenceEngine::forward_layer(int layer_idx) {
     launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
-
-    if (batch_debug && i == 0) {
-        cudaDeviceSynchronize();
-        fprintf(stderr, "[SINGLE L0] After norm:\n");
-        dump_half("norm_out[0:8]", norm_out, 8);
-        dump_half("hidden[0:8]", state_.hidden, 8);
-    }
 
     // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
@@ -307,13 +318,6 @@ void InferenceEngine::forward_layer(int layer_idx) {
         else { auto& w = layer.k_proj_nf4; GEMV_4BIT(w, norm_out, state_.k_buf, stream); }
         if (layer.v_proj_fp16) cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
         else { auto& w = layer.v_proj_nf4; GEMV_4BIT(w, norm_out, state_.v_buf, stream); }
-    }
-
-    if (batch_debug && layer_idx == 0) {
-        cudaDeviceSynchronize();
-        fprintf(stderr, "[SINGLE L0] After QKV projection:\n");
-        dump_half("q_buf[0:8]", state_.q_buf, 8);
-        dump_half("k_buf[0:8]", state_.k_buf, 8);
     }
 
     // 2b. Fused QKNorm
@@ -396,13 +400,16 @@ void InferenceEngine::decode(int token_id) {
     // Embedding lookup
     launch_embedding(weights_.embed_tokens, token_id, state_.hidden, HIDDEN_SIZE, stream);
 
-    // Forward through all layers
+    if (debug_mode) { cudaDeviceSynchronize(); fprintf(stderr, "[S] embed: "); dump_half("h", state_.hidden, 8); }
+
     for (int i = 0; i < NUM_LAYERS; i++) {
         forward_layer(i);
     }
 
+    if (debug_mode) { cudaDeviceSynchronize(); fprintf(stderr, "[S] after layers: "); dump_half("h", state_.hidden, 8); debug_mode = 0; }
+
     // Final LayerNorm
-    half* norm_out = state_.ffn_out; // borrow
+    half* norm_out = state_.ffn_out;
     launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
                     HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
@@ -1038,7 +1045,7 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
     project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
 
-    if (batch_debug && layer_idx == 0) {
+    if (debug_mode && layer_idx == 0) {
         cudaDeviceSynchronize();
         fprintf(stderr, "[BATCH L0] After QKV projection:\n");
         dump_half("q_buf[0:8]", B->q_buf, 8);
@@ -1100,7 +1107,7 @@ static void dump_float(const char* label, const float* d, int n) {
     printf("\n");
 }
 
-static int batch_debug = 1;
+static int debug_mode = 1;
 
 void InferenceEngine::decode_batch(int G) {
     cudaStream_t stream = 0;
@@ -1109,11 +1116,11 @@ void InferenceEngine::decode_batch(int G) {
     // Embedding
     launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, stream);
 
-    if (batch_debug) {
+    if (debug_mode) {
         cudaDeviceSynchronize();
         fprintf(stderr, "[BATCH] After embedding:\n");
         dump_half("hidden[0:8]", B->hidden, 8);
-        batch_debug = 0;  // only debug first token
+        debug_mode = 0;  // only debug first token
     }
 
     // Forward layers
