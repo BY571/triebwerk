@@ -1139,13 +1139,14 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         }
         if (all_done) break;
 
-        // Advance positions
-        for (int g = 0; g < G; g++)
-            if (!B->h_finished[g]) B->h_positions[g]++;
+        // Decode with sampled tokens at current positions
         cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
-
         decode_batch(G);
+
+        // Advance positions AFTER decode (matches single-sequence behavior)
+        for (int g = 0; g < G; g++)
+            if (!B->h_finished[g]) B->h_positions[g]++;
     }
 
     return outputs;
