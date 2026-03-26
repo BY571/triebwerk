@@ -183,7 +183,6 @@ void InferenceEngine::load_weights(const std::string& prefix) {
                        INTERMEDIATE_SIZE, HIDDEN_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
         load_mlp_proj("down_proj", &L.down_proj_fp16, &L.down_proj_nf4,
                        HIDDEN_SIZE, INTERMEDIATE_SIZE, L.mlp_is_nf4, L.mlp_is_q4l);
-        }
         L.input_layernorm = load(p + "input_layernorm.weight");
         L.post_attn_layernorm = load(p + "post_attention_layernorm.weight");
         L.q_norm = load(p + "self_attn.q_norm.weight");
