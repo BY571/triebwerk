@@ -250,6 +250,11 @@ public:
     // Reset KV cache for new generation
     void reset();
 
+    // Share embedding from PyTorch (avoids 311MB duplicate on Jetson)
+    // Pass the raw GPU pointer from model.embed_tokens.weight.data_ptr()
+    void share_embedding(void* external_embed_ptr);
+    bool embed_is_external_ = false;
+
     // Prefill: process multiple tokens at once
     // Returns logits for the last token
     void prefill(const int* token_ids, int n_tokens);

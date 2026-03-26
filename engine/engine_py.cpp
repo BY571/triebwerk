@@ -33,6 +33,12 @@ PYBIND11_MODULE(jetson_engine, m) {
         .def("reset", &InferenceEngine::reset,
              "Reset KV cache for new generation")
 
+        .def("share_embedding", [](InferenceEngine& self, size_t ptr) {
+                 self.share_embedding(reinterpret_cast<void*>(ptr));
+             },
+             py::arg("data_ptr"),
+             "Share embedding from PyTorch tensor (pass tensor.data_ptr())")
+
         .def("generate", &InferenceEngine::generate,
              py::arg("prompt"),
              py::arg("max_new_tokens") = 512,

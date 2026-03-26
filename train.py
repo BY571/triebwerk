@@ -359,6 +359,13 @@ def train(args):
         print(f"\nLoading C++ engine weights from {weights_path}...")
         engine.load_weights(weights_path)
 
+        # Share PyTorch's embedding with C++ engine (saves 311MB on Jetson)
+        embed_weight = model.base_model.model.model.embed_tokens.weight
+        if embed_weight.dtype == torch.float16 and embed_weight.is_cuda:
+            engine.share_embedding(embed_weight.data_ptr())
+        else:
+            print(f"  Warning: cannot share embedding (dtype={embed_weight.dtype}, cuda={embed_weight.is_cuda})")
+
         from lora_sync import LoRASyncer
         syncer = LoRASyncer(model, engine,
                             lora_alpha=args.lora_rank, lora_rank=args.lora_rank)

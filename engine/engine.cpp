@@ -358,6 +358,15 @@ void InferenceEngine::precompute_rope() {
 // Reset
 // ============================================================================
 
+void InferenceEngine::share_embedding(void* external_embed_ptr) {
+    if (weights_.embed_tokens && !embed_is_external_) {
+        cudaFree(weights_.embed_tokens);
+    }
+    weights_.embed_tokens = (half*)external_embed_ptr;
+    embed_is_external_ = true;
+    std::cout << "  Embedding shared from PyTorch (saved ~311MB)" << std::endl;
+}
+
 void InferenceEngine::reset() {
     state_.current_pos = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
