@@ -197,7 +197,11 @@ def grpo_step(model, optimizer, scaler, samples, config):
         total_loss_val += sample_loss.item()
         n_valid += 1
 
-        del outputs, logits, new_lp, input_tensor
+        del outputs, logits, new_lp, input_tensor, sample_loss
+        del ratio, per_token_loss, new_comp_lp
+        if config.loss_type == "grpo":
+            pass  # surr1, surr2 already out of scope
+        torch.cuda.empty_cache()
 
     # Gradient clipping + optimizer step
     if n_valid > 0:
@@ -453,14 +457,16 @@ def train(args):
         # 4. Compute advantages
         advantages = compute_advantages(rewards, args.num_generations)
 
-        # 5. Compute reference log-probs (old policy, no grad)
+        # 5. Compute reference log-probs (old policy, no grad, one at a time)
+        old_logprobs = []
         with torch.no_grad():
-            old_logprobs = [
-                compute_token_logprobs(
+            for c in completions:
+                lp = compute_token_logprobs(
                     model, c["prompt_ids"], c["completion_ids"], device
-                ).detach()
-                for c in completions
-            ]
+                ).detach().cpu()  # move to CPU immediately to free GPU
+                old_logprobs.append(lp)
+                torch.cuda.empty_cache()
+        old_logprobs = [lp.to(device) for lp in old_logprobs]
 
         # 6. Build samples for the gradient step
         samples = []
