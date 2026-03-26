@@ -63,6 +63,16 @@ void InferenceEngine::load_weights(const std::string& prefix) {
     weights_.embed_tokens = load("embed_tokens.weight");
     weights_.final_layernorm = load("norm.weight");
 
+    // Helper: checked cudaMalloc
+    auto checked_malloc = [](void** ptr, size_t size, const char* name) {
+        cudaError_t err = cudaMalloc(ptr, size);
+        if (err != cudaSuccess) {
+            std::cerr << "  CUDA MALLOC FAILED: " << name << " (" << size << " bytes): "
+                      << cudaGetErrorString(err) << std::endl;
+            *ptr = nullptr;
+        }
+    };
+
     // NF4 loader (used for both attention and MLP)
     auto load_nf4 = [&](const std::string& prefix, int out_dim, int in_dim) -> NF4Weight {
                 NF4Weight w = {};
@@ -76,20 +86,29 @@ void InferenceEngine::load_weights(const std::string& prefix) {
                 auto it_q = index.find(prefix + ".weight.quant_map");
 
                 if (it_d != index.end()) {
-                    void* p; cudaMalloc(&p, it_d->second.nbytes);
-                    cudaMemcpy(p, base + it_d->second.offset, it_d->second.nbytes, cudaMemcpyHostToDevice);
+                    void* p;
+                    checked_malloc(&p, it_d->second.nbytes, (prefix + ".data").c_str());
+                    if (p) cudaMemcpy(p, base + it_d->second.offset, it_d->second.nbytes, cudaMemcpyHostToDevice);
                     w.data = (uint8_t*)p;
                 }
                 if (it_a != index.end()) {
-                    void* p; cudaMalloc(&p, it_a->second.nbytes);
-                    cudaMemcpy(p, base + it_a->second.offset, it_a->second.nbytes, cudaMemcpyHostToDevice);
+                    void* p;
+                    checked_malloc(&p, it_a->second.nbytes, (prefix + ".absmax").c_str());
+                    if (p) cudaMemcpy(p, base + it_a->second.offset, it_a->second.nbytes, cudaMemcpyHostToDevice);
                     w.absmax = (float*)p;
                 }
                 if (it_q != index.end()) {
-                    void* p; cudaMalloc(&p, it_q->second.nbytes);
-                    cudaMemcpy(p, base + it_q->second.offset, it_q->second.nbytes, cudaMemcpyHostToDevice);
+                    void* p;
+                    checked_malloc(&p, it_q->second.nbytes, (prefix + ".qmap").c_str());
+                    if (p) cudaMemcpy(p, base + it_q->second.offset, it_q->second.nbytes, cudaMemcpyHostToDevice);
                     w.quant_map = (float*)p;
                 }
+        if (!w.data || !w.absmax || !w.quant_map) {
+            std::cerr << "  NF4 MISSING: " << prefix
+                      << " data=" << (void*)w.data
+                      << " absmax=" << (void*)w.absmax
+                      << " qmap=" << (void*)w.quant_map << std::endl;
+        }
         return w;
     };
 
@@ -103,35 +122,50 @@ void InferenceEngine::load_weights(const std::string& prefix) {
         auto& L = weights_.layers[i];
         std::string p = "layers." + std::to_string(i) + ".";
 
-        // Attention: check if NF4 or fp16
-        std::string qw = p + "self_attn.q_proj.weight";
-        if (is_nf4(qw)) {
-            L.attn_is_nf4 = true;
-            L.q_proj_fp16 = L.k_proj_fp16 = L.v_proj_fp16 = L.o_proj_fp16 = nullptr;
-            L.q_proj_nf4 = load_nf4(p + "self_attn.q_proj", Q_DIM, HIDDEN_SIZE);
-            L.k_proj_nf4 = load_nf4(p + "self_attn.k_proj", KV_DIM, HIDDEN_SIZE);
-            L.v_proj_nf4 = load_nf4(p + "self_attn.v_proj", KV_DIM, HIDDEN_SIZE);
-            L.o_proj_nf4 = load_nf4(p + "self_attn.o_proj", HIDDEN_SIZE, Q_DIM);
-        } else {
-            L.attn_is_nf4 = false;
-            L.q_proj_fp16 = load(qw);
-            L.k_proj_fp16 = load(p + "self_attn.k_proj.weight");
-            L.v_proj_fp16 = load(p + "self_attn.v_proj.weight");
-            L.o_proj_fp16 = load(p + "self_attn.o_proj.weight");
+        // Attention: check EACH projection individually
+        L.attn_is_nf4 = false;
+        struct { const char* name; half** fp16; NF4Weight* nf4; int out_dim; int in_dim; } attn_projs[] = {
+            {"self_attn.q_proj", &L.q_proj_fp16, &L.q_proj_nf4, Q_DIM, HIDDEN_SIZE},
+            {"self_attn.k_proj", &L.k_proj_fp16, &L.k_proj_nf4, KV_DIM, HIDDEN_SIZE},
+            {"self_attn.v_proj", &L.v_proj_fp16, &L.v_proj_nf4, KV_DIM, HIDDEN_SIZE},
+            {"self_attn.o_proj", &L.o_proj_fp16, &L.o_proj_nf4, HIDDEN_SIZE, Q_DIM},
+        };
+        for (auto& ap : attn_projs) {
+            std::string wname = p + ap.name + ".weight";
+            if (is_nf4(wname)) {
+                *ap.nf4 = load_nf4(p + ap.name, ap.out_dim, ap.in_dim);
+                *ap.fp16 = nullptr;
+                L.attn_is_nf4 = true;
+            } else {
+                *ap.fp16 = load(wname);
+            }
         }
 
-        // MLP: check if NF4 or fp16
-        std::string gw = p + "mlp.gate_proj.weight";
-        if (is_nf4(gw)) {
-            L.mlp_is_nf4 = true;
-            L.gate_proj_fp16 = L.up_proj_fp16 = L.down_proj_fp16 = nullptr;
+        // MLP: check EACH weight individually (unsloth mixes NF4 and fp16 within a layer)
+        L.mlp_is_nf4 = false;  // will be set true if ANY weight is NF4
+
+        // Gate
+        if (is_nf4(p + "mlp.gate_proj.weight")) {
             L.gate_proj_nf4 = load_nf4(p + "mlp.gate_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
-            L.up_proj_nf4 = load_nf4(p + "mlp.up_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
-            L.down_proj_nf4 = load_nf4(p + "mlp.down_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE);
+            L.gate_proj_fp16 = nullptr;
+            L.mlp_is_nf4 = true;
         } else {
-            L.mlp_is_nf4 = false;
-            L.gate_proj_fp16 = load(gw);
+            L.gate_proj_fp16 = load(p + "mlp.gate_proj.weight");
+        }
+        // Up
+        if (is_nf4(p + "mlp.up_proj.weight")) {
+            L.up_proj_nf4 = load_nf4(p + "mlp.up_proj", INTERMEDIATE_SIZE, HIDDEN_SIZE);
+            L.up_proj_fp16 = nullptr;
+            L.mlp_is_nf4 = true;
+        } else {
             L.up_proj_fp16 = load(p + "mlp.up_proj.weight");
+        }
+        // Down
+        if (is_nf4(p + "mlp.down_proj.weight")) {
+            L.down_proj_nf4 = load_nf4(p + "mlp.down_proj", HIDDEN_SIZE, INTERMEDIATE_SIZE);
+            L.down_proj_fp16 = nullptr;
+            L.mlp_is_nf4 = true;
+        } else {
             L.down_proj_fp16 = load(p + "mlp.down_proj.weight");
         }
         L.input_layernorm = load(p + "input_layernorm.weight");
