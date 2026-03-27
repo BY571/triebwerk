@@ -71,6 +71,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL, quantization_config=bnb_config,
         device_map="auto", torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     if tokenizer.pad_token is None:
