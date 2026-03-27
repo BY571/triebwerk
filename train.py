@@ -120,8 +120,10 @@ def compute_token_logprobs(model, prompt_ids, completion_ids, device):
     full_ids = prompt_ids + completion_ids
     input_tensor = torch.tensor([full_ids], device=device)
 
-    outputs = model(input_tensor)
-    logits = outputs.logits[0, :-1, :]
+    # Use same AMP context as grpo_step to avoid ratio bias from precision mismatch
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        outputs = model(input_tensor)
+        logits = outputs.logits[0, :-1, :]
     targets = input_tensor[0, 1:]
 
     # fp32 softmax for numerical stability
@@ -152,21 +154,23 @@ def grpo_step(model, optimizer, scaler, samples, config):
     device = next(model.parameters()).device
     optimizer.zero_grad()
 
-    n_samples = len(samples)
+    # Pre-filter valid samples for correct loss normalization
+    valid_samples = [s for s in samples
+                     if s["mask_weight"] != 0.0
+                     and len(s["completion_ids"]) > 0
+                     and s["advantage"] != 0.0]
+    n_valid = len(valid_samples)
+    if n_valid == 0:
+        optimizer.zero_grad()
+        return 0.0
+
     total_loss_val = 0.0
-    n_valid = 0
 
-    for s in samples:
-        if s["mask_weight"] == 0.0 or len(s["completion_ids"]) == 0:
-            continue
-
+    for s in valid_samples:
         p_ids = s["prompt_ids"]
         c_ids = s["completion_ids"]
-        old_lp = s["old_logprobs"]  # (comp_len,) detached
+        old_lp = s["old_logprobs"]
         adv = s["advantage"]
-
-        if adv == 0.0:
-            continue
 
         full_ids = p_ids + c_ids
         input_tensor = torch.tensor([full_ids], device=device)
@@ -180,7 +184,6 @@ def grpo_step(model, optimizer, scaler, samples, config):
             new_lp = new_lp.gather(1, targets.unsqueeze(1)).squeeze(1)
             new_comp_lp = new_lp[len(p_ids) - 1:]
 
-            # Ratio: pi_new / pi_old
             ratio = torch.exp(new_comp_lp - old_lp)
 
             if config.loss_type == "grpo":
@@ -193,15 +196,17 @@ def grpo_step(model, optimizer, scaler, samples, config):
 
             sample_loss = per_token_loss.mean()
 
-        scaler.scale(sample_loss / n_samples).backward()
+        # Normalize by n_valid (not n_samples) for consistent gradients
+        scaler.scale(sample_loss / n_valid).backward()
         total_loss_val += sample_loss.item()
-        n_valid += 1
 
+        # Free all intermediates (no empty_cache — allocator reuses blocks)
         del outputs, logits, new_lp, input_tensor, sample_loss
         del ratio, per_token_loss, new_comp_lp
         if config.loss_type == "grpo":
-            pass  # surr1, surr2 already out of scope
-        torch.cuda.empty_cache()
+            del surr1, surr2
+        else:
+            del clipped_ratio
 
     # Gradient clipping + optimizer step
     if n_valid > 0:
@@ -470,10 +475,10 @@ def train(args):
             for c in completions:
                 lp = compute_token_logprobs(
                     model, c["prompt_ids"], c["completion_ids"], device
-                ).detach().cpu()  # move to CPU immediately to free GPU
+                ).detach()
                 old_logprobs.append(lp)
-                torch.cuda.empty_cache()
-        old_logprobs = [lp.to(device) for lp in old_logprobs]
+                # No .cpu() on Jetson unified memory (CPU=GPU RAM, copy wastes memory)
+                # No empty_cache() — allocator reuses blocks for next forward pass
 
         # 6. Build samples for the gradient step
         samples = []

@@ -375,24 +375,6 @@ void InferenceEngine::reset() {
     }
 }
 
-// Debug helpers
-static void dump_half(const char* label, const half* d, int n) {
-    std::vector<half> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(half), cudaMemcpyDeviceToHost);
-    fprintf(stderr, "  %s:", label);
-    for (int i = 0; i < std::min(n, 8); i++)
-        fprintf(stderr, " %.4f", __half2float(h[i]));
-    fprintf(stderr, "\n"); fflush(stderr);
-}
-static void dump_float(const char* label, const float* d, int n) {
-    std::vector<float> h(n);
-    cudaMemcpy(h.data(), d, n * sizeof(float), cudaMemcpyDeviceToHost);
-    fprintf(stderr, "  %s:", label);
-    for (int i = 0; i < std::min(n, 8); i++) fprintf(stderr, " %.4f", h[i]);
-    fprintf(stderr, "\n"); fflush(stderr);
-}
-static int debug_mode = 0;
-
 // ============================================================================
 // Forward pass through one transformer layer
 // ============================================================================
@@ -408,9 +390,7 @@ void InferenceEngine::forward_layer(int layer_idx) {
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
 
-    if (debug_mode && layer_idx == 0) {
         cudaDeviceSynchronize();
-        fprintf(stderr, "[S] L0 norm: "); dump_half("n", norm_out, 8);
     }
 
     // Quantize input to int8 for dp4a
@@ -515,13 +495,11 @@ void InferenceEngine::decode(int token_id) {
     // Embedding lookup
     launch_embedding(weights_.embed_tokens, token_id, state_.hidden, HIDDEN_SIZE, stream);
 
-    if (debug_mode) { cudaDeviceSynchronize(); fprintf(stderr, "[S] embed: "); dump_half("h", state_.hidden, 8); }
 
     for (int i = 0; i < NUM_LAYERS; i++) {
         forward_layer(i);
     }
 
-    if (debug_mode) { cudaDeviceSynchronize(); fprintf(stderr, "[S] after layers: "); dump_half("h", state_.hidden, 8); debug_mode = 0; }
 
     // Final LayerNorm
     half* norm_out = state_.ffn_out;
@@ -1165,11 +1143,7 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
     project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
 
-    if (debug_mode && layer_idx == 0) {
         cudaDeviceSynchronize();
-        fprintf(stderr, "[B] L0 norm: "); dump_half("n", B->norm_buf, 8);
-        fprintf(stderr, "[B] L0 q: "); dump_half("q", B->q_buf, 8);
-        fprintf(stderr, "[B] L0 k: "); dump_half("k", B->k_buf, 8);
     }
 
     // 3. QKNorm + RoPE
@@ -1219,7 +1193,6 @@ void InferenceEngine::decode_batch(int G) {
     // Embedding
     launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, HIDDEN_SIZE, stream);
 
-    if (debug_mode) { cudaDeviceSynchronize(); fprintf(stderr, "[B] embed: "); dump_half("h", B->hidden, 8); }
 
     // Forward layers
     for (int i = 0; i < NUM_LAYERS; i++)
