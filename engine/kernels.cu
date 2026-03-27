@@ -774,40 +774,69 @@ __global__ void gpu_sample_kernel(
     }
     __syncthreads();
 
-    // Step 4: Top-p nucleus sampling
-    // Zero-sort approach: iteratively pick the highest-prob token,
-    // accumulate into nucleus, zero it out. No arrays, no sorting.
-    // Repeat until nucleus mass >= top_p, then sample within nucleus.
-    if (threadIdx.x == 0) {
-        if (top_p >= 1.0f) {
+    // Step 4: Top-p nucleus sampling using ALL threads for parallel max-find
+    if (top_p >= 1.0f) {
+        // No top-p, thread 0 does simple cumulative scan
+        if (threadIdx.x == 0) {
             float cum = 0.0f;
             for (int i = 0; i < vocab_size; i++) {
                 cum += logits[i];
                 if (cum >= random_val) { *result = i; return; }
             }
             *result = vocab_size - 1;
-        } else {
-            // Pass 1: find nucleus by repeatedly extracting max until mass >= top_p
-            // Mark non-nucleus tokens by negating them
-            float nucleus_mass = 0.0f;
-            while (nucleus_mass < top_p) {
-                // Find current max
-                float max_p = 0.0f;
-                int max_i = 0;
-                for (int i = 0; i < vocab_size; i++) {
-                    if (logits[i] > max_p) { max_p = logits[i]; max_i = i; }
-                }
-                if (max_p <= 0.0f) break;
-                nucleus_mass += max_p;
-                logits[max_i] = -max_p;  // negate to mark as "in nucleus"
+        }
+    } else {
+        // All threads participate in finding nucleus tokens
+        // Iteratively: all threads find max in parallel, thread 0 accumulates
+        __shared__ float s_nucleus_mass;
+        if (threadIdx.x == 0) s_nucleus_mass = 0.0f;
+        __syncthreads();
+
+        while (true) {
+            // Parallel max reduction across all threads
+            float my_max = 0.0f;
+            int my_idx = 0;
+            for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+                if (logits[i] > my_max) { my_max = logits[i]; my_idx = i; }
             }
 
-            // Pass 2: sample within nucleus (negated tokens are nucleus members)
-            float threshold = random_val * nucleus_mass;
+            // Warp reduction for max
+            for (int off = warpSize/2; off > 0; off /= 2) {
+                float other_max = __shfl_down_sync(0xFFFFFFFF, my_max, off);
+                int other_idx = __shfl_down_sync(0xFFFFFFFF, my_idx, off);
+                if (other_max > my_max) { my_max = other_max; my_idx = other_idx; }
+            }
+            if (lane_id == 0) { shared_max[warp_id] = my_max; shared_sum[warp_id] = __int_as_float(my_idx); }
+            __syncthreads();
+            if (warp_id == 0) {
+                my_max = (lane_id < (blockDim.x+31)/32) ? shared_max[lane_id] : 0.0f;
+                my_idx = (lane_id < (blockDim.x+31)/32) ? __float_as_int(shared_sum[lane_id]) : 0;
+                for (int off = warpSize/2; off > 0; off /= 2) {
+                    float o = __shfl_down_sync(0xFFFFFFFF, my_max, off);
+                    int oi = __shfl_down_sync(0xFFFFFFFF, my_idx, off);
+                    if (o > my_max) { my_max = o; my_idx = oi; }
+                }
+                if (lane_id == 0) {
+                    if (my_max <= 0.0f || s_nucleus_mass >= top_p) {
+                        shared_max[0] = -1.0f;  // signal done
+                    } else {
+                        s_nucleus_mass += my_max;
+                        logits[my_idx] = -my_max;  // negate = in nucleus
+                        shared_max[0] = my_max;
+                    }
+                }
+            }
+            __syncthreads();
+            if (shared_max[0] < 0.0f) break;  // done building nucleus
+        }
+
+        // Thread 0 samples from nucleus
+        if (threadIdx.x == 0) {
+            float threshold = random_val * s_nucleus_mass;
             float cum = 0.0f;
             for (int i = 0; i < vocab_size; i++) {
-                if (logits[i] < 0.0f) {  // nucleus member
-                    cum += -logits[i];  // un-negate
+                if (logits[i] < 0.0f) {
+                    cum += -logits[i];
                     if (cum >= threshold) { *result = i; return; }
                 }
             }
@@ -1360,27 +1389,56 @@ __global__ void sample_batch_kernel(
         col[i] *= inv_sum;
     __syncthreads();
 
-    // Step 4: Top-p nucleus sampling (iterative max extraction, no arrays)
-    if (threadIdx.x == 0) {
-        float r = randoms[g];
-        if (top_p >= 1.0f) {
+    // Step 4: Top-p nucleus sampling (parallel max-find with all threads)
+    if (top_p >= 1.0f) {
+        if (threadIdx.x == 0) {
             float cum = 0.0f;
             for (int i = 0; i < vocab; i++) {
                 cum += col[i];
-                if (cum >= r) { tokens[g] = i; return; }
+                if (cum >= randoms[g]) { tokens[g] = i; return; }
             }
             tokens[g] = vocab - 1;
-        } else {
-            float nucleus_mass = 0.0f;
-            while (nucleus_mass < top_p) {
-                float max_p = 0.0f; int max_i = 0;
-                for (int i = 0; i < vocab; i++)
-                    if (col[i] > max_p) { max_p = col[i]; max_i = i; }
-                if (max_p <= 0.0f) break;
-                nucleus_mass += max_p;
-                col[max_i] = -max_p;
+        }
+    } else {
+        __shared__ float s_nuc_mass;
+        if (threadIdx.x == 0) s_nuc_mass = 0.0f;
+        __syncthreads();
+
+        while (true) {
+            float my_max = 0.0f; int my_idx = 0;
+            for (int i = threadIdx.x; i < vocab; i += blockDim.x)
+                if (col[i] > my_max) { my_max = col[i]; my_idx = i; }
+            for (int off = warpSize/2; off > 0; off /= 2) {
+                float o = __shfl_down_sync(0xFFFFFFFF, my_max, off);
+                int oi = __shfl_down_sync(0xFFFFFFFF, my_idx, off);
+                if (o > my_max) { my_max = o; my_idx = oi; }
             }
-            float threshold = r * nucleus_mass;
+            if (lid == 0) { s_max[wid] = my_max; s_sum[wid] = __int_as_float(my_idx); }
+            __syncthreads();
+            if (wid == 0) {
+                my_max = (lid < n_warps) ? s_max[lid] : 0.0f;
+                my_idx = (lid < n_warps) ? __float_as_int(s_sum[lid]) : 0;
+                for (int off = warpSize/2; off > 0; off /= 2) {
+                    float o = __shfl_down_sync(0xFFFFFFFF, my_max, off);
+                    int oi = __shfl_down_sync(0xFFFFFFFF, my_idx, off);
+                    if (o > my_max) { my_max = o; my_idx = oi; }
+                }
+                if (lid == 0) {
+                    if (my_max <= 0.0f || s_nuc_mass >= top_p) {
+                        s_max[0] = -1.0f;
+                    } else {
+                        s_nuc_mass += my_max;
+                        col[my_idx] = -my_max;
+                        s_max[0] = my_max;
+                    }
+                }
+            }
+            __syncthreads();
+            if (s_max[0] < 0.0f) break;
+        }
+
+        if (threadIdx.x == 0) {
+            float threshold = randoms[g] * s_nuc_mass;
             float cum = 0.0f;
             for (int i = 0; i < vocab; i++) {
                 if (col[i] < 0.0f) {
