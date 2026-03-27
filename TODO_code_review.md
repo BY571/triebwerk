@@ -38,3 +38,23 @@
 - [ ] Rename NF4Weight struct to QuantWeight (used for both NF4 and Q4L)
 - [ ] Remove disabled CUDA graph code path (or fix it for Q4L)
 - [ ] Remove dead NF4 kernel code in kernels.cu (lines 39-179)
+
+## CUDA Performance Optimizations (from agents, estimated 15-33% decode speedup)
+
+### Immediate
+- [x] `--use_fast_math` in CMakeLists.txt (~5% from faster expf/rsqrtf)
+
+### High priority (10-20% combined)
+- [ ] Load q8 input into shared memory in dp4a kernel (avoid redundant global loads, ~30 lines)
+- [ ] Dynamic 128 vs 256 threads/block based on in_dim (fix 50% idle threads for in_dim=1024)
+- [ ] Add `__launch_bounds__(256, 6)` to hot kernels for register optimization
+
+### Medium priority
+- [ ] Fuse q8 quantization into RMSNorm kernel (eliminate 2KB global round-trip)
+- [ ] Vectorize attention V-sum with half2 loads (halve load instructions)
+- [ ] 4-byte vectorized dequant kernel for batched GEMM path
+
+### Validated: no benefit on Jetson
+- Zero-copy / cudaMallocManaged for weights (same physical RAM, no improvement)
+- L2 cache persistence for input vector (too small, stays in cache naturally)
+- Fuse RMSNorm + GEMV (parallelism mismatch, 2KB intermediate negligible)
