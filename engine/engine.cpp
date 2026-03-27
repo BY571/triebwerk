@@ -141,6 +141,7 @@ extern "C" {
     void launch_sample_batch(float* logits, int* tokens, const float* randoms, int vocab, int G, float temperature, float top_p, cudaStream_t s);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
+    void launch_copy_rms_norm_q8(const half* input, const half* weight, half* residual, half* norm_out, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
     void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
     void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
@@ -404,16 +405,18 @@ void InferenceEngine::forward_layer(int layer_idx) {
     auto& kv = state_.kv_cache[layer_idx];
     cudaStream_t stream = 0; // default stream
 
-    // 1. Input LayerNorm
+    // 1. Input LayerNorm (fused with q8 quantization for dp4a path)
     half* norm_out = state_.ffn_out;
-    launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
-                         state_.residual, norm_out,
-                         HIDDEN_SIZE, RMS_NORM_EPS, stream);
-
-    // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
-        launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
-                                 state_.q8_sums, HIDDEN_SIZE, stream);
+        // Fused: copy + RMSNorm + q8 quantize in one kernel (saves 1 launch + 2KB round-trip)
+        launch_copy_rms_norm_q8(state_.hidden, layer.input_layernorm,
+                                state_.residual, norm_out,
+                                state_.q8_data, state_.q8_scales, state_.q8_sums,
+                                HIDDEN_SIZE, RMS_NORM_EPS, stream);
+    } else {
+        launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
+                             state_.residual, norm_out,
+                             HIDDEN_SIZE, RMS_NORM_EPS, stream);
     }
 
     // 2. QKV projections
@@ -462,15 +465,16 @@ void InferenceEngine::forward_layer(int layer_idx) {
     // 7. Residual add (hidden += residual)
     launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
 
-    // 8. Post-attention LayerNorm: copy hidden → residual AND normalize → norm_out
-    launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
-                         state_.residual, norm_out,
-                         HIDDEN_SIZE, RMS_NORM_EPS, stream);
-
-    // Quantize FFN input for dp4a (shared by gate+up+down)
+    // 8. Post-attention LayerNorm (fused with q8 quantization for dp4a)
     if (weights_.is_q4l) {
-        launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
-                                 state_.q8_sums, HIDDEN_SIZE, stream);
+        launch_copy_rms_norm_q8(state_.hidden, layer.post_attn_layernorm,
+                                state_.residual, norm_out,
+                                state_.q8_data, state_.q8_scales, state_.q8_sums,
+                                HIDDEN_SIZE, RMS_NORM_EPS, stream);
+    } else {
+        launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
+                             state_.residual, norm_out,
+                             HIDDEN_SIZE, RMS_NORM_EPS, stream);
     }
 
     // 9. FFN: fused gate+up when both quantized (NF4 fused, Q4L individual dp4a)

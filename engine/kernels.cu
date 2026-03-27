@@ -267,6 +267,102 @@ __global__ void copy_rms_norm_kernel(
     }
 }
 
+// Fused: copy + RMSNorm + q8 quantization in one kernel (saves 1 launch + 2KB round-trip)
+__global__ void copy_rms_norm_q8_kernel(
+    const half* __restrict__ input,
+    const half* __restrict__ weight,
+    half* __restrict__ residual,
+    half* __restrict__ norm_out,
+    int8_t* __restrict__ q8_data,     // output: quantized norm_out
+    float* __restrict__ q8_scales,    // output: per-block scale
+    float* __restrict__ q8_sums,      // output: per-block sum
+    int dim, float eps
+) {
+    // Pass 1: copy + sum of squares
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        half val_h = input[i];
+        residual[i] = val_h;
+        float val = __half2float(val_h);
+        sum_sq += val * val;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+    __shared__ float shared[32];
+    int warp_id = threadIdx.x / warpSize;
+    int lane_id = threadIdx.x % warpSize;
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_sq = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane_id] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset /= 2)
+            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
+        if (lane_id == 0) shared[0] = sum_sq;
+    }
+    __syncthreads();
+    float rms = rsqrtf(shared[0] / dim + eps);
+
+    // Pass 2: normalize, write fp16, AND quantize to int8
+    // Process in 64-element blocks for q8 quantization
+    const int block_size = 64;
+    int n_blocks = dim / block_size;
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        int base = blk * block_size;
+
+        // Find max abs in this q8 block (all threads participate)
+        float my_max = 0.0f;
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
+            float val = __half2float(input[base + i]) * rms * __half2float(weight[base + i]);
+            my_max = fmaxf(my_max, fabsf(val));
+        }
+        // Quick warp reduce for max (single block, all threads)
+        for (int off = warpSize / 2; off > 0; off /= 2)
+            my_max = fmaxf(my_max, __shfl_down_sync(0xFFFFFFFF, my_max, off));
+        if (lane_id == 0) shared[warp_id] = my_max;
+        __syncthreads();
+        if (warp_id == 0) {
+            my_max = (lane_id < (blockDim.x + 31) / 32) ? shared[lane_id] : 0.0f;
+            for (int off = warpSize / 2; off > 0; off /= 2)
+                my_max = fmaxf(my_max, __shfl_down_sync(0xFFFFFFFF, my_max, off));
+            if (lane_id == 0) shared[0] = my_max;
+        }
+        __syncthreads();
+
+        float scale = shared[0] / 127.0f;
+        if (scale < 1e-10f) scale = 1e-10f;
+        float inv_scale = 1.0f / scale;
+
+        // Normalize, write fp16, quantize to int8, compute sum
+        int my_sum = 0;
+        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
+            float val = __half2float(input[base + i]) * rms * __half2float(weight[base + i]);
+            norm_out[base + i] = __float2half(val);
+            int q = __float2int_rn(val * inv_scale);
+            q = max(-127, min(127, q));
+            q8_data[base + i] = (int8_t)q;
+            my_sum += q;
+        }
+
+        // Reduce sum for this block
+        for (int off = warpSize / 2; off > 0; off /= 2)
+            my_sum += __shfl_down_sync(0xFFFFFFFF, my_sum, off);
+        if (lane_id == 0) shared[warp_id] = (float)my_sum;
+        __syncthreads();
+        if (warp_id == 0) {
+            float s = (lane_id < (blockDim.x + 31) / 32) ? shared[lane_id] : 0.0f;
+            for (int off = warpSize / 2; off > 0; off /= 2)
+                s += __shfl_down_sync(0xFFFFFFFF, s, off);
+            if (lane_id == 0) {
+                q8_scales[blk] = scale;
+                q8_sums[blk] = s;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // ============================================================================
 // Kernel 2b: Fused QKNorm (RMSNorm applied per-head to Q and K)
 // ============================================================================
@@ -511,14 +607,20 @@ __global__ void gqa_attention_decode_kernel(
     }
     __syncthreads();
 
-    // Weighted sum of V: output[d] = sum_p(scores[p] * v_cache[p, kv_head, d])
+    // Weighted sum of V with half2 vectorized loads (2 elements per load)
     half* out_head = output + head * head_dim;
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float val = 0.0f;
+    int half_dim = head_dim / 2;
+    for (int d2 = threadIdx.x; d2 < half_dim; d2 += blockDim.x) {
+        float val0 = 0.0f, val1 = 0.0f;
         for (int p = 0; p <= pos; p++) {
-            val += scores[p] * __half2float(v_cache[p * (num_kv_heads * head_dim) + kv_head * head_dim + d]);
+            half2 v2 = reinterpret_cast<const half2*>(
+                &v_cache[p * (num_kv_heads * head_dim) + kv_head * head_dim])[d2];
+            float s = scores[p];
+            val0 += s * __half2float(v2.x);
+            val1 += s * __half2float(v2.y);
         }
-        out_head[d] = __float2half(val);
+        reinterpret_cast<half2*>(out_head)[d2] = __halves2half2(
+            __float2half(val0), __float2half(val1));
     }
 }
 
@@ -879,6 +981,16 @@ void launch_copy_rms_norm(
     int dim, float eps, cudaStream_t stream
 ) {
     copy_rms_norm_kernel<<<1, 256, 0, stream>>>(input, weight, residual, norm_out, dim, eps);
+}
+
+void launch_copy_rms_norm_q8(
+    const half* input, const half* weight,
+    half* residual, half* norm_out,
+    int8_t* q8_data, float* q8_scales, float* q8_sums,
+    int dim, float eps, cudaStream_t stream
+) {
+    copy_rms_norm_q8_kernel<<<1, 256, 0, stream>>>(
+        input, weight, residual, norm_out, q8_data, q8_scales, q8_sums, dim, eps);
 }
 
 void launch_qk_norm(
@@ -1269,13 +1381,20 @@ __global__ void gqa_attention_batch_kernel(
         scores[p] *= inv_sum;
     __syncthreads();
 
-    // Weighted sum of V
+    // Weighted sum of V with half2 vectorized loads
     half* oh = out + g * q_dim + head * head_dim;
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float val = 0.0f;
-        for (int p = 0; p <= pos; p++)
-            val += scores[p] * __half2float(cache_v[(g * max_seq_len + p) * kv_dim + kv_head * head_dim + d]);
-        oh[d] = __float2half(val);
+    int half_dim = head_dim / 2;
+    for (int d2 = threadIdx.x; d2 < half_dim; d2 += blockDim.x) {
+        float val0 = 0.0f, val1 = 0.0f;
+        for (int p = 0; p <= pos; p++) {
+            half2 v2 = reinterpret_cast<const half2*>(
+                &cache_v[(g * max_seq_len + p) * kv_dim + kv_head * head_dim])[d2];
+            float s = scores[p];
+            val0 += s * __half2float(v2.x);
+            val1 += s * __half2float(v2.y);
+        }
+        reinterpret_cast<half2*>(oh)[d2] = __halves2half2(
+            __float2half(val0), __float2half(val1));
     }
 }
 
