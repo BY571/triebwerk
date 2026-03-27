@@ -774,25 +774,46 @@ __global__ void gpu_sample_kernel(
     }
     __syncthreads();
 
-    // Step 4: cumulative sum sampling (thread 0 only, sequential but on GPU)
+    // Step 4: Top-p nucleus sampling (correct: sort by probability, not index)
     if (threadIdx.x == 0) {
-        float threshold = random_val;
-
-        if (top_p < 1.0f) {
-            // Simple top-p: scan from highest probability
-            // For speed, we just do a linear scan (vocab is large but on GPU cache)
-            threshold *= top_p;  // scale threshold to top_p region
-        }
-
-        float cum = 0.0f;
-        for (int i = 0; i < vocab_size; i++) {
-            cum += logits[i];
-            if (cum >= threshold) {
-                *result = i;
-                return;
+        if (top_p >= 1.0f) {
+            // No top-p filtering, just sample from full distribution
+            float cum = 0.0f;
+            for (int i = 0; i < vocab_size; i++) {
+                cum += logits[i];
+                if (cum >= random_val) { *result = i; return; }
             }
+            *result = vocab_size - 1;
+        } else {
+            // Top-p: find probability threshold via binary search,
+            // then sample only from tokens above threshold.
+            // Binary search: find min_prob such that sum(p >= min_prob) >= top_p
+            float lo = 0.0f, hi = 1.0f;
+            for (int iter = 0; iter < 20; iter++) {  // 20 iters = 1e-6 precision
+                float mid = (lo + hi) * 0.5f;
+                float mass = 0.0f;
+                for (int i = 0; i < vocab_size; i++)
+                    if (logits[i] >= mid) mass += logits[i];
+                if (mass >= top_p) lo = mid;
+                else hi = mid;
+            }
+            float min_prob = lo;
+
+            // Compute nucleus mass and sample within it
+            float nucleus_mass = 0.0f;
+            for (int i = 0; i < vocab_size; i++)
+                if (logits[i] >= min_prob) nucleus_mass += logits[i];
+
+            float threshold = random_val * nucleus_mass;
+            float cum = 0.0f;
+            for (int i = 0; i < vocab_size; i++) {
+                if (logits[i] >= min_prob) {
+                    cum += logits[i];
+                    if (cum >= threshold) { *result = i; return; }
+                }
+            }
+            *result = vocab_size - 1;
         }
-        *result = vocab_size - 1;
     }
 }
 
@@ -1340,16 +1361,41 @@ __global__ void sample_batch_kernel(
         col[i] *= inv_sum;
     __syncthreads();
 
-    // Step 4: cumulative sum sampling (thread 0 only)
+    // Step 4: Top-p nucleus sampling (correct: filter by probability, not index)
     if (threadIdx.x == 0) {
-        float threshold = randoms[g];
-        if (top_p < 1.0f) threshold *= top_p;
-        float cum = 0.0f;
-        for (int i = 0; i < vocab; i++) {
-            cum += col[i];
-            if (cum >= threshold) { tokens[g] = i; return; }
+        float r = randoms[g];
+        if (top_p >= 1.0f) {
+            float cum = 0.0f;
+            for (int i = 0; i < vocab; i++) {
+                cum += col[i];
+                if (cum >= r) { tokens[g] = i; return; }
+            }
+            tokens[g] = vocab - 1;
+        } else {
+            // Binary search for min probability in the nucleus
+            float lo = 0.0f, hi = 1.0f;
+            for (int iter = 0; iter < 20; iter++) {
+                float mid = (lo + hi) * 0.5f;
+                float mass = 0.0f;
+                for (int i = 0; i < vocab; i++)
+                    if (col[i] >= mid) mass += col[i];
+                if (mass >= top_p) lo = mid;
+                else hi = mid;
+            }
+            float min_prob = lo;
+            float nucleus_mass = 0.0f;
+            for (int i = 0; i < vocab; i++)
+                if (col[i] >= min_prob) nucleus_mass += col[i];
+            float threshold = r * nucleus_mass;
+            float cum = 0.0f;
+            for (int i = 0; i < vocab; i++) {
+                if (col[i] >= min_prob) {
+                    cum += col[i];
+                    if (cum >= threshold) { tokens[g] = i; return; }
+                }
+            }
+            tokens[g] = vocab - 1;
         }
-        tokens[g] = vocab - 1;
     }
 }
 
