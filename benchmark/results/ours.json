@@ -1,0 +1,7 @@
+{
+  "engine": "ours_dp4a",
+  "steps": 20,
+  "total_time_s": 727.3,
+  "avg_step_time_s": 36.4,
+  "config": {"model": "Qwen/Qwen3-0.6B", "G": 4, "max_tokens": 512, "lora_rank": 16, "loss": "dapo"}
+}

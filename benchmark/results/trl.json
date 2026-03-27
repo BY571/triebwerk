@@ -1,0 +1,7 @@
+{
+  "engine": "trl",
+  "steps": 20,
+  "total_time_s": 2612.1,
+  "avg_step_time_s": 130.6,
+  "config": {"model": "Qwen/Qwen3-0.6B", "G": 4, "max_tokens": 512, "lora_rank": 16, "loss": "dapo"}
+}
