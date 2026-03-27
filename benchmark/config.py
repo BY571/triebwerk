@@ -26,7 +26,7 @@ WARMUP_RATIO = 0.1
 EPSILON = 0.2             # PPO clip range
 
 # Training
-BENCHMARK_STEPS = 50      # enough to measure speed, not overnight
+BENCHMARK_STEPS = 20      # enough to measure average step time
 GRADIENT_CHECKPOINTING = True
 
 # Quantization

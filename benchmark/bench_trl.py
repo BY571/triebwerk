@@ -95,7 +95,7 @@ def main():
         "answer": extract_hash_answer(x["answer"]),
     })
 
-    # GRPOConfig
+    # GRPOConfig — all TRL optimizations enabled for fairest comparison
     grpo_config = GRPOConfig(
         output_dir="/tmp/bench_trl",
         run_name="benchmark-trl",
@@ -113,6 +113,10 @@ def main():
         mask_truncated_completions=MASK_TRUNCATED,
         fp16=True, bf16=False,
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
+        # TRL speed optimizations (give TRL every advantage)
+        num_iterations=2,           # reuse generations for 2 gradient steps
+        log_completions=False,       # skip string processing overhead
+        disable_dropout=True,        # fewer ops per forward pass
         logging_steps=1,
         save_strategy="no",
         report_to="none",

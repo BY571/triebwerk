@@ -42,7 +42,7 @@ def main():
         temperature=TEMPERATURE,
         top_p=TOP_P,
         epsilon=EPSILON,
-        epsilon_high=None,
+        epsilon_high=EPSILON * 2,  # DAPO uses wider upper clip
         loss_type=LOSS_TYPE,
         mask_truncated=MASK_TRUNCATED,
         output_dir="/tmp/bench_ours",
