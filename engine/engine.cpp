@@ -109,14 +109,13 @@ static void cublas_hgemv(const half* weight, const half* input, half* output,
 
 // Helper to avoid void** casts everywhere
 template<typename T>
-inline cudaError_t cudaMallocTyped(T** ptr, size_t size) {
-    return cudaMalloc(reinterpret_cast<void**>(ptr), size);
+inline void cudaMallocChecked(T** ptr, size_t size) {
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(ptr), size));
 }
 
 // Forward declarations for kernel launchers (defined in kernels.cu)
 extern "C" {
     void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
-    void launch_nf4_gemv(const uint8_t* packed, const float* absmax, const float* quant_map, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
     void launch_nf4_gemv_fast(const uint8_t* packed, const float* absmax, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
     void launch_q4l_gemv(const uint8_t* packed, const float* scales, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
     void launch_nf4_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
@@ -252,47 +251,47 @@ void InferenceEngine::allocate_buffers() {
 
     // Allocate KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMallocTyped(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half));
-        cudaMallocTyped(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half));
+        cudaMallocChecked(&state_.kv_cache[i].key, max_seq_len * KV_DIM * sizeof(half)));
+        cudaMallocChecked(&state_.kv_cache[i].value, max_seq_len * KV_DIM * sizeof(half)));
     }
 
     // Allocate scratch buffers
-    cudaMallocTyped(&state_.hidden, HIDDEN_SIZE * sizeof(half));
-    cudaMallocTyped(&state_.residual, HIDDEN_SIZE * sizeof(half));
-    cudaMallocTyped(&state_.q_buf, Q_DIM * sizeof(half));
-    cudaMallocTyped(&state_.k_buf, KV_DIM * sizeof(half));
-    cudaMallocTyped(&state_.v_buf, KV_DIM * sizeof(half));
-    cudaMallocTyped(&state_.attn_out, Q_DIM * sizeof(half));
-    cudaMallocTyped(&state_.gate_buf, INTERMEDIATE_SIZE * sizeof(half));
-    cudaMallocTyped(&state_.up_buf, INTERMEDIATE_SIZE * sizeof(half));
-    cudaMallocTyped(&state_.ffn_out, HIDDEN_SIZE * sizeof(half));
-    cudaMallocTyped(&state_.logits, VOCAB_SIZE * sizeof(float));
-    cudaMallocTyped(&state_.attn_scores, NUM_HEADS * max_seq_len * sizeof(float));
+    cudaMallocChecked(&state_.hidden, HIDDEN_SIZE * sizeof(half)));
+    cudaMallocChecked(&state_.residual, HIDDEN_SIZE * sizeof(half)));
+    cudaMallocChecked(&state_.q_buf, Q_DIM * sizeof(half)));
+    cudaMallocChecked(&state_.k_buf, KV_DIM * sizeof(half)));
+    cudaMallocChecked(&state_.v_buf, KV_DIM * sizeof(half)));
+    cudaMallocChecked(&state_.attn_out, Q_DIM * sizeof(half)));
+    cudaMallocChecked(&state_.gate_buf, INTERMEDIATE_SIZE * sizeof(half)));
+    cudaMallocChecked(&state_.up_buf, INTERMEDIATE_SIZE * sizeof(half)));
+    cudaMallocChecked(&state_.ffn_out, HIDDEN_SIZE * sizeof(half)));
+    cudaMallocChecked(&state_.logits, VOCAB_SIZE * sizeof(float)));
+    cudaMallocChecked(&state_.attn_scores, NUM_HEADS * max_seq_len * sizeof(float)));
 
     // Allocate and precompute RoPE tables
-    cudaMallocTyped(&state_.rope_cos, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
-    cudaMallocTyped(&state_.rope_sin, max_seq_len * (HEAD_DIM / 2) * sizeof(half));
+    cudaMallocChecked(&state_.rope_cos, max_seq_len * (HEAD_DIM / 2) * sizeof(half)));
+    cudaMallocChecked(&state_.rope_sin, max_seq_len * (HEAD_DIM / 2) * sizeof(half)));
     precompute_rope();
 
     // GPU-side sampling
-    cudaMallocTyped(&state_.sample_result, sizeof(int));
+    cudaMallocChecked(&state_.sample_result, sizeof(int)));
 
     // NF4 LM head temp buffer (allocated upfront, ~304KB)
-    cudaMallocTyped(&state_.lm_head_fp16_buf, VOCAB_SIZE * sizeof(half));
+    cudaMallocChecked(&state_.lm_head_fp16_buf, VOCAB_SIZE * sizeof(half)));
 
     // dp4a input quantization buffers
     int max_q8_dim = INTERMEDIATE_SIZE; // largest input dimension
     int max_q8_blocks = max_q8_dim / 64;
-    cudaMallocTyped(&state_.q8_data, max_q8_dim * sizeof(int8_t));
-    cudaMallocTyped(&state_.q8_scales, max_q8_blocks * sizeof(float));
-    cudaMallocTyped(&state_.q8_sums, max_q8_blocks * sizeof(float));
+    cudaMallocChecked(&state_.q8_data, max_q8_dim * sizeof(int8_t));
+    cudaMallocChecked(&state_.q8_scales, max_q8_blocks * sizeof(float)));
+    cudaMallocChecked(&state_.q8_sums, max_q8_blocks * sizeof(float)));
 
     // LoRA scratch
-    cudaMallocTyped(&state_.lora_scratch, 64 * sizeof(half)); // max rank 64
+    cudaMallocChecked(&state_.lora_scratch, 64 * sizeof(half)); // max rank 64
 
     // CUDA graph control buffers (device-side, updated before graph replay)
-    cudaMallocTyped(&state_.d_token_id, sizeof(int));
-    cudaMallocTyped(&state_.d_pos, sizeof(int));
+    cudaMallocChecked(&state_.d_token_id, sizeof(int)));
+    cudaMallocChecked(&state_.d_pos, sizeof(int)));
 
     // Pinned host memory for async graph control updates
     cudaHostAlloc(&h_token_id_pinned_, sizeof(int), cudaHostAllocDefault);
@@ -391,8 +390,8 @@ void InferenceEngine::share_embedding(void* external_embed_ptr) {
 void InferenceEngine::reset() {
     state_.current_pos = 0;
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMemset(state_.kv_cache[i].key, 0, state_.max_seq_len * KV_DIM * sizeof(half));
-        cudaMemset(state_.kv_cache[i].value, 0, state_.max_seq_len * KV_DIM * sizeof(half));
+        cudaMemset(state_.kv_cache[i].key, 0, state_.max_seq_len * KV_DIM * sizeof(half)));
+        cudaMemset(state_.kv_cache[i].value, 0, state_.max_seq_len * KV_DIM * sizeof(half)));
     }
 }
 
@@ -882,8 +881,8 @@ void InferenceEngine::update_lora_weight(
     // Create or update adapter
     if (!*target) {
         *target = new LoRAAdapter();
-        cudaMallocTyped(&(*target)->A, A_rows * A_cols * sizeof(half));
-        cudaMallocTyped(&(*target)->B, B_rows * B_cols * sizeof(half));
+        cudaMallocChecked(&(*target)->A, A_rows * A_cols * sizeof(half)));
+        cudaMallocChecked(&(*target)->B, B_rows * B_cols * sizeof(half)));
     }
 
     // Copy weights to GPU
@@ -1087,32 +1086,32 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->G = G;
     batch_->max_seq_len = max_seq_len;
 
-    cudaMalloc(&batch_->hidden, HIDDEN_SIZE * G * sizeof(half));
-    cudaMalloc(&batch_->residual, HIDDEN_SIZE * G * sizeof(half));
-    cudaMalloc(&batch_->norm_buf, HIDDEN_SIZE * G * sizeof(half));
-    cudaMalloc(&batch_->q_buf, Q_DIM * G * sizeof(half));
-    cudaMalloc(&batch_->k_buf, KV_DIM * G * sizeof(half));
-    cudaMalloc(&batch_->v_buf, KV_DIM * G * sizeof(half));
-    cudaMalloc(&batch_->attn_out, Q_DIM * G * sizeof(half));
-    cudaMalloc(&batch_->gate_buf, INTERMEDIATE_SIZE * G * sizeof(half));
-    cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half));
-    cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float));
-    cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&batch_->hidden, HIDDEN_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->residual, HIDDEN_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->norm_buf, HIDDEN_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->q_buf, Q_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->k_buf, KV_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->v_buf, KV_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->attn_out, Q_DIM * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->gate_buf, INTERMEDIATE_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float)));
     // Dequant scratch fp16 (largest projection)
-    cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
+    CUDA_CHECK(cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)));
     // KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
-        cudaMalloc(&batch_->kv_values[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half));
+        CUDA_CHECK(cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half)));
+        CUDA_CHECK(cudaMalloc(&batch_->kv_values[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half)));
     }
     // Per-sequence state
     batch_->h_positions = new int[G]();
-    cudaMalloc(&batch_->d_positions, G * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&batch_->d_positions, G * sizeof(int)));
     batch_->h_tokens = new int[G]();
-    cudaMalloc(&batch_->d_tokens, G * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&batch_->d_tokens, G * sizeof(int)));
     batch_->h_finished = new bool[G]();
     batch_->h_randoms = new float[G]();
-    cudaMalloc(&batch_->d_randoms, G * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&batch_->d_randoms, G * sizeof(float)));
 
     std::cout << "  Batch allocated: G=" << G << " max_seq=" << max_seq_len
               << " KV=" << (G * max_seq_len * KV_DIM * 2 * NUM_LAYERS * 2 / 1e6) << "MB" << std::endl;
@@ -1245,8 +1244,8 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
     // Reset
     for (int i = 0; i < G; i++) { B->h_positions[i] = 0; B->h_finished[i] = false; }
     for (int i = 0; i < NUM_LAYERS; i++) {
-        cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
-        cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+        cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half)));
+        cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half)));
     }
 
     std::vector<std::vector<int>> outputs(G);

@@ -196,9 +196,16 @@ def grpo_step(model, optimizer, scaler, samples, config):
 
             sample_loss = per_token_loss.mean()
 
+        # Skip NaN/Inf losses (can happen with fp16 overflow)
+        loss_val = sample_loss.item()
+        if math.isnan(loss_val) or math.isinf(loss_val):
+            del outputs, logits, new_lp, input_tensor, sample_loss
+            del ratio, per_token_loss, new_comp_lp
+            continue
+
         # Normalize by n_valid (not n_samples) for consistent gradients
         scaler.scale(sample_loss / n_valid).backward()
-        total_loss_val += sample_loss.item()
+        total_loss_val += loss_val
 
         # Free all intermediates (no empty_cache — allocator reuses blocks)
         del outputs, logits, new_lp, input_tensor, sample_loss
@@ -211,10 +218,14 @@ def grpo_step(model, optimizer, scaler, samples, config):
     # Gradient clipping + optimizer step
     if n_valid > 0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad],
             config.max_grad_norm,
         )
+        if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
+            print(f"  WARNING: NaN/Inf gradient norm, skipping step")
+            optimizer.zero_grad()
+            return float('nan')
         scaler.step(optimizer)
         scaler.update()
     else:
