@@ -775,8 +775,9 @@ __global__ void gpu_sample_kernel(
     __syncthreads();
 
     // Step 4: Top-p nucleus sampling
-    // Fast approach: one pass to find max, set cutoff at max*0.001,
-    // collect tokens above cutoff (typically <200), sort those, sample.
+    // Zero-sort approach: iteratively pick the highest-prob token,
+    // accumulate into nucleus, zero it out. No arrays, no sorting.
+    // Repeat until nucleus mass >= top_p, then sample within nucleus.
     if (threadIdx.x == 0) {
         if (top_p >= 1.0f) {
             float cum = 0.0f;
@@ -786,46 +787,31 @@ __global__ void gpu_sample_kernel(
             }
             *result = vocab_size - 1;
         } else {
-            // Find max probability (already normalized, max is typically 0.01-0.3)
-            float max_p = 0.0f;
-            for (int i = 0; i < vocab_size; i++)
-                if (logits[i] > max_p) max_p = logits[i];
-
-            // Collect tokens above cutoff (0.1% of max — filters 99.9% of vocab)
-            float cutoff = max_p * 0.001f;
-            const int MAX_CAND = 1024;
-            float cand_p[MAX_CAND];
-            int cand_id[MAX_CAND];
-            int nc = 0;
-            for (int i = 0; i < vocab_size && nc < MAX_CAND; i++) {
-                if (logits[i] >= cutoff) {
-                    cand_p[nc] = logits[i]; cand_id[nc] = i; nc++;
-                }
-            }
-
-            // Sort candidates descending (insertion sort, nc typically <200)
-            for (int i = 1; i < nc; i++) {
-                float p = cand_p[i]; int id = cand_id[i]; int j = i-1;
-                while (j >= 0 && cand_p[j] < p) {
-                    cand_p[j+1] = cand_p[j]; cand_id[j+1] = cand_id[j]; j--;
-                }
-                cand_p[j+1] = p; cand_id[j+1] = id;
-            }
-
-            // Accumulate top_p mass, sample within nucleus
+            // Pass 1: find nucleus by repeatedly extracting max until mass >= top_p
+            // Mark non-nucleus tokens by negating them
             float nucleus_mass = 0.0f;
-            int ns = 0;
-            for (int i = 0; i < nc; i++) {
-                nucleus_mass += cand_p[i]; ns++;
-                if (nucleus_mass >= top_p) break;
+            while (nucleus_mass < top_p) {
+                // Find current max
+                float max_p = 0.0f;
+                int max_i = 0;
+                for (int i = 0; i < vocab_size; i++) {
+                    if (logits[i] > max_p) { max_p = logits[i]; max_i = i; }
+                }
+                if (max_p <= 0.0f) break;
+                nucleus_mass += max_p;
+                logits[max_i] = -max_p;  // negate to mark as "in nucleus"
             }
+
+            // Pass 2: sample within nucleus (negated tokens are nucleus members)
             float threshold = random_val * nucleus_mass;
             float cum = 0.0f;
-            for (int i = 0; i < ns; i++) {
-                cum += cand_p[i];
-                if (cum >= threshold) { *result = cand_id[i]; return; }
+            for (int i = 0; i < vocab_size; i++) {
+                if (logits[i] < 0.0f) {  // nucleus member
+                    cum += -logits[i];  // un-negate
+                    if (cum >= threshold) { *result = i; return; }
+                }
             }
-            *result = cand_id[ns > 0 ? ns-1 : 0];
+            *result = vocab_size - 1;
         }
     }
 }
@@ -1374,7 +1360,7 @@ __global__ void sample_batch_kernel(
         col[i] *= inv_sum;
     __syncthreads();
 
-    // Step 4: Top-p nucleus sampling (cutoff + sort candidates)
+    // Step 4: Top-p nucleus sampling (iterative max extraction, no arrays)
     if (threadIdx.x == 0) {
         float r = randoms[g];
         if (top_p >= 1.0f) {
@@ -1385,32 +1371,24 @@ __global__ void sample_batch_kernel(
             }
             tokens[g] = vocab - 1;
         } else {
-            float max_p = 0.0f;
-            for (int i = 0; i < vocab; i++)
-                if (col[i] > max_p) max_p = col[i];
-            float cutoff = max_p * 0.001f;
-            const int MAX_CAND = 1024;
-            float cand_p[MAX_CAND]; int cand_id[MAX_CAND]; int nc = 0;
-            for (int i = 0; i < vocab && nc < MAX_CAND; i++)
-                if (col[i] >= cutoff) { cand_p[nc] = col[i]; cand_id[nc] = i; nc++; }
-            for (int i = 1; i < nc; i++) {
-                float p = cand_p[i]; int id = cand_id[i]; int j = i-1;
-                while (j >= 0 && cand_p[j] < p) {
-                    cand_p[j+1] = cand_p[j]; cand_id[j+1] = cand_id[j]; j--;
+            float nucleus_mass = 0.0f;
+            while (nucleus_mass < top_p) {
+                float max_p = 0.0f; int max_i = 0;
+                for (int i = 0; i < vocab; i++)
+                    if (col[i] > max_p) { max_p = col[i]; max_i = i; }
+                if (max_p <= 0.0f) break;
+                nucleus_mass += max_p;
+                col[max_i] = -max_p;
+            }
+            float threshold = r * nucleus_mass;
+            float cum = 0.0f;
+            for (int i = 0; i < vocab; i++) {
+                if (col[i] < 0.0f) {
+                    cum += -col[i];
+                    if (cum >= threshold) { tokens[g] = i; return; }
                 }
-                cand_p[j+1] = p; cand_id[j+1] = id;
             }
-            float nucleus_mass = 0.0f; int ns = 0;
-            for (int i = 0; i < nc; i++) {
-                nucleus_mass += cand_p[i]; ns++;
-                if (nucleus_mass >= top_p) break;
-            }
-            float threshold = r * nucleus_mass; float cum = 0.0f;
-            for (int i = 0; i < ns; i++) {
-                cum += cand_p[i];
-                if (cum >= threshold) { tokens[g] = cand_id[i]; return; }
-            }
-            tokens[g] = cand_id[ns > 0 ? ns-1 : 0];
+            tokens[g] = vocab - 1;
         }
     }
 }
