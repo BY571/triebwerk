@@ -4,8 +4,13 @@ project(jetson_llm_engine LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
-# Jetson Orin = sm_87 (Ampere)
-set(CMAKE_CUDA_ARCHITECTURES 87)
+# GPU architecture (default: Jetson Orin sm_87, override with -DCMAKE_CUDA_ARCHITECTURES=89 for RTX)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 87)
+endif()
+
+# Fast math for CUDA kernels (~5% speedup from faster intrinsics)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
 
 # Find Python for pybind11
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
