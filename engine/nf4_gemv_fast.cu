@@ -249,8 +249,16 @@ __global__ void quantize_input_q8_kernel(
 // dp4a Q4L GEMV: integer dot product, 4 MACs per instruction
 // ============================================================================
 
+// dp4a GEMV with shared memory input caching.
+// The q8 input vector is loaded into shared memory ONCE per block,
+// then reused across all ROWS_PER_BLOCK rows. This eliminates
+// redundant global loads (each row was re-reading the same input).
+// Dynamic shared memory: s_sums[RPB*nwarps] + s_q8[in_dim] + s_q8_sc[in_dim/64]
+
 __device__ __forceinline__ void q4l_dp4a_gemv_block(
-    float* __restrict__ s_sums,
+    float* __restrict__ s_sums,    // shared: [ROWS_PER_BLOCK * n_warps]
+    int8_t* __restrict__ s_q8,     // shared: [in_dim] cached input
+    float* __restrict__ s_q8_sc,   // shared: [blocks_per_row] cached scales
     const uint8_t* __restrict__ weight_data,
     const float* __restrict__ w_scales,
     const int8_t* __restrict__ q8_data,
@@ -259,11 +267,19 @@ __device__ __forceinline__ void q4l_dp4a_gemv_block(
     half* __restrict__ output,
     int first_row, int out_dim, int in_dim
 ) {
+    const int n_warps = blockDim.x / 32;
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
     const int bytes_per_row = in_dim / 2;
     const int blocks_per_row = in_dim >> 6;
     const int vec_per_row = bytes_per_row >> 2;
+
+    // Cooperatively load q8 input + scales into shared memory (once per block)
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x)
+        s_q8[i] = q8_data[i];
+    for (int i = threadIdx.x; i < blocks_per_row; i += blockDim.x)
+        s_q8_sc[i] = q8_scales[i];
+    __syncthreads();
 
     for (int r = 0; r < ROWS_PER_BLOCK; r++) {
         int row = first_row + r;
@@ -275,45 +291,40 @@ __device__ __forceinline__ void q4l_dp4a_gemv_block(
         const uint32_t* row_u32 = reinterpret_cast<const uint32_t*>(
             weight_data + row_byte_start);
 
-        for (int vi = threadIdx.x; vi < vec_per_row; vi += THREADS_PER_BLOCK) {
+        for (int vi = threadIdx.x; vi < vec_per_row; vi += (int)blockDim.x) {
             uint32_t packed = __ldg(&row_u32[vi]);
             int base_elem = vi << 3;
             int w_blk = base_elem >> 6;
             float w_sc = __ldg(&w_scales[w_scale_start + w_blk]);
-            float x_sc = __ldg(&q8_scales[w_blk]);
+            float x_sc = s_q8_sc[w_blk];  // from shared memory
 
-            // dp4a-friendly extraction (matches packing from convert_weights.py):
-            // lo nibbles = elements [0,1,2,3], hi nibbles = elements [4,5,6,7]
             int vi_lo = (packed >> 0) & 0x0F0F0F0F;
             int vi_hi = (packed >> 4) & 0x0F0F0F0F;
 
-            const int* q8_i32 = reinterpret_cast<const int*>(&q8_data[base_elem]);
-            int u0 = __ldg(&q8_i32[0]);  // q8[0..3]
-            int u1 = __ldg(&q8_i32[1]);  // q8[4..7]
+            // Read q8 from shared memory instead of global
+            const int* sq8_i32 = reinterpret_cast<const int*>(&s_q8[base_elem]);
+            int u0 = sq8_i32[0];
+            int u1 = sq8_i32[1];
 
-            // dp4a: sumi = sum(nibble_i * q8_i) for 8 elements
             int sumi = 0;
             sumi = __dp4a(vi_lo, u0, sumi);
             sumi = __dp4a(vi_hi, u1, sumi);
 
-            // Compute sum of q8 values for these 8 elements using dp4a trick:
-            // dp4a(0x01010101, q8_i32, 0) = q8[0] + q8[1] + q8[2] + q8[3]
             int q8_sum_local = 0;
             q8_sum_local = __dp4a(0x01010101, u0, q8_sum_local);
             q8_sum_local = __dp4a(0x01010101, u1, q8_sum_local);
 
-            // dot = ws * xs * (sumi - 8 * q8_sum) for these 8 elements
             sum += w_sc * x_sc * ((float)sumi - 8.0f * (float)q8_sum_local);
         }
 
-        // Warp + cross-warp reduction
+        // Warp + cross-warp reduction (dynamic n_warps)
         #pragma unroll
         for (int off = 16; off > 0; off /= 2)
             sum += __shfl_down_sync(0xFFFFFFFF, sum, off);
-        if (lane_id == 0) s_sums[r * N_WARPS + warp_id] = sum;
+        if (lane_id == 0) s_sums[r * n_warps + warp_id] = sum;
         __syncthreads();
         if (warp_id == 0) {
-            float total = (lane_id < N_WARPS) ? s_sums[r * N_WARPS + lane_id] : 0.0f;
+            float total = (lane_id < n_warps) ? s_sums[r * n_warps + lane_id] : 0.0f;
             #pragma unroll
             for (int off = 16; off > 0; off /= 2)
                 total += __shfl_down_sync(0xFFFFFFFF, total, off);
@@ -323,15 +334,23 @@ __device__ __forceinline__ void q4l_dp4a_gemv_block(
     }
 }
 
-// dp4a kernel wrapper
-__global__ void q4l_dp4a_kernel(
+// dp4a kernel wrapper with dynamic shared memory
+// Layout: s_sums[RPB * n_warps] + s_q8[in_dim] + s_q8_sc[in_dim/64]
+__global__ __launch_bounds__(256, 6)
+void q4l_dp4a_kernel(
     const uint8_t* __restrict__ w, const float* __restrict__ w_scales,
     const int8_t* __restrict__ q8, const float* __restrict__ q8_sc,
     const float* __restrict__ q8_sm, half* __restrict__ y,
     int in_dim, int out_dim
 ) {
-    __shared__ float s_sums[ROWS_PER_BLOCK * N_WARPS + 1]; // +1 for offset scratch
-    q4l_dp4a_gemv_block(s_sums, w, w_scales, q8, q8_sc, q8_sm, y,
+    extern __shared__ char smem[];
+    int n_warps = blockDim.x / 32;
+
+    float* s_sums = reinterpret_cast<float*>(smem);
+    int8_t* s_q8 = reinterpret_cast<int8_t*>(s_sums + ROWS_PER_BLOCK * n_warps);
+    float* s_q8_sc = reinterpret_cast<float*>(s_q8 + in_dim);
+
+    q4l_dp4a_gemv_block(s_sums, s_q8, s_q8_sc, w, w_scales, q8, q8_sc, q8_sm, y,
                         blockIdx.x * ROWS_PER_BLOCK, out_dim, in_dim);
 }
 
@@ -481,14 +500,23 @@ void launch_quantize_input_q8(
         input, q8_data, q8_scales, q8_sums, dim);
 }
 
-// dp4a Q4L GEMV
+// dp4a Q4L GEMV — dynamic thread count + shared memory input caching
 void launch_q4l_dp4a_gemv(
     const uint8_t* w, const float* w_scales,
     const int8_t* q8, const float* q8_sc, const float* q8_sm,
     half* y, int out_dim, int in_dim, cudaStream_t stream
 ) {
     int nb = (out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
-    q4l_dp4a_kernel<<<nb, THREADS_PER_BLOCK, 0, stream>>>(
+    // Dynamic thread count: 128 for small dims (fix 50% idle), 256 for larger
+    int vec_per_row = in_dim / 2 / 4;
+    int threads = (vec_per_row <= 128) ? 128 : 256;
+    int n_warps = threads / 32;
+    int blocks_per_row = in_dim / 64;
+    // Shared memory: s_sums + s_q8 input + s_q8_scales
+    size_t smem = ROWS_PER_BLOCK * n_warps * sizeof(float)
+                + in_dim * sizeof(int8_t)
+                + blocks_per_row * sizeof(float);
+    q4l_dp4a_kernel<<<nb, threads, smem, stream>>>(
         w, w_scales, q8, q8_sc, q8_sm, y, in_dim, out_dim);
 }
 
