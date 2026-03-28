@@ -1253,7 +1253,14 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
     int G = prompts.size();
     int max_prompt_len = 0;
     for (auto& p : prompts) max_prompt_len = std::max(max_prompt_len, (int)p.size());
-    int total_max_len = max_prompt_len + max_new_tokens;
+    // Cap total sequence length to avoid OOM from KV cache
+    // G=4, seq=600, 28 layers: ~275MB KV cache. Max ~620 to stay under budget.
+    int total_max_len = std::min(max_prompt_len + max_new_tokens, 620);
+    int effective_max_tokens = total_max_len - max_prompt_len;
+    if (effective_max_tokens < max_new_tokens) {
+        // Silently reduce completion length to fit memory budget
+        max_new_tokens = std::max(effective_max_tokens, 64);
+    }
 
     alloc_batch(G, total_max_len);
     auto* B = batch_;
