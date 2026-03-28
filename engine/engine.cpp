@@ -117,7 +117,6 @@ inline void cudaMallocChecked(T** ptr, size_t size) {
 extern "C" {
     void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
     void launch_nf4_gemv_fast(const uint8_t* packed, const float* absmax, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
-    void launch_q4l_gemv(const uint8_t* packed, const float* scales, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
     void launch_nf4_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_q4l_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_nf4_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
@@ -140,21 +139,15 @@ extern "C" {
     void launch_sample_batch(float* logits, int* tokens, const float* randoms, int vocab, int G, float temperature, float top_p, cudaStream_t s);
     void launch_rms_norm(const half* input, const half* weight, half* output, int dim, float eps, cudaStream_t stream);
     void launch_copy_rms_norm(const half* input, const half* weight, half* residual, half* norm_out, int dim, float eps, cudaStream_t stream);
-    void launch_copy_rms_norm_q8(const half* input, const half* weight, half* residual, half* norm_out, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, float eps, cudaStream_t stream);
     void launch_qk_norm(half* q, half* k, const half* q_weight, const half* k_weight, int num_q_heads, int num_kv_heads, int head_dim, float eps, cudaStream_t stream);
     void launch_rope(half* q, half* k, const half* cos_table, const half* sin_table, int pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
     void launch_gqa_attention(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, int pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
     void launch_silu_gate_mul(const half* gate, const half* up, half* output, int dim, cudaStream_t stream);
     void launch_embedding(const half* embed_table, int token_id, half* output, int hidden_dim, cudaStream_t stream);
     void launch_residual_add(half* output, const half* residual, int dim, cudaStream_t stream);
-    void launch_lm_head(const half* weight, const half* input, float* logits, int hidden_dim, int vocab_size, cudaStream_t stream);
     void launch_fp16_to_fp32(const half* input, float* output, int n, cudaStream_t stream);
     void launch_argmax(const float* logits, int* result, int vocab_size, cudaStream_t stream);
     void launch_gpu_sample(float* logits, int* result, int vocab_size, float temperature, float random_val, float top_p, cudaStream_t stream);
-    void launch_embedding_device(const half* embed_table, const int* d_token_id, half* output, int hidden_dim, cudaStream_t stream);
-    void launch_rope_device(half* q, half* k, const half* cos_table_base, const half* sin_table_base, const int* d_pos, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
-    void launch_gqa_attention_device(const half* q, const half* k_cache, const half* v_cache, half* output, float* attn_scratch, const int* d_pos, int max_seq_len, int num_heads, int num_kv_heads, int head_dim, cudaStream_t stream);
-    void launch_kv_cache_write(half* k_cache, half* v_cache, const half* k_new, const half* v_new, const int* d_pos, int kv_dim, cudaStream_t stream);
 }
 
 // JSON config parser (simple, no external dependency)
@@ -289,14 +282,6 @@ void InferenceEngine::allocate_buffers() {
     // LoRA scratch
     cudaMallocChecked(&state_.lora_scratch, 64 * sizeof(half)); // max rank 64
 
-    // CUDA graph control buffers (device-side, updated before graph replay)
-    cudaMallocChecked(&state_.d_token_id, sizeof(int));
-    cudaMallocChecked(&state_.d_pos, sizeof(int));
-
-    // Pinned host memory for async graph control updates
-    cudaHostAlloc(&h_token_id_pinned_, sizeof(int), cudaHostAllocDefault);
-    cudaHostAlloc(&h_pos_pinned_, sizeof(int), cudaHostAllocDefault);
-
     // Zero-init weights
     memset(&weights_, 0, sizeof(weights_));
 }
@@ -325,10 +310,6 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(state_.q8_scales);
     cudaFree(state_.q8_sums);
     cudaFree(state_.lora_scratch);
-    cudaFree(state_.d_token_id);
-    cudaFree(state_.d_pos);
-    if (h_token_id_pinned_) cudaFreeHost(h_token_id_pinned_);
-    if (h_pos_pinned_) cudaFreeHost(h_pos_pinned_);
 
     // Free batch state if allocated
     if (batch_) {
@@ -501,22 +482,14 @@ void InferenceEngine::forward_layer(int layer_idx) {
 // ============================================================================
 
 void InferenceEngine::decode(int token_id) {
-    // Use CUDA graph if captured (eliminates kernel launch overhead)
-    if (use_cuda_graph_ && graph_captured_) {
-        decode_graph(token_id);
-        return;
-    }
-
     cudaStream_t stream = 0;
 
     // Embedding lookup
     launch_embedding(weights_.embed_tokens, token_id, state_.hidden, HIDDEN_SIZE, stream);
 
-
     for (int i = 0; i < NUM_LAYERS; i++) {
         forward_layer(i);
     }
-
 
     // Final LayerNorm
     half* norm_out = state_.ffn_out;
@@ -677,183 +650,6 @@ std::vector<std::pair<std::string, float>> InferenceEngine::profile_decode(int t
 }
 
 // ============================================================================
-// Graph-captured forward layer (uses device-side position)
-// ============================================================================
-
-void InferenceEngine::forward_layer_graph(int layer_idx, cudaStream_t stream) {
-    auto& layer = weights_.layers[layer_idx];
-    auto& kv = state_.kv_cache[layer_idx];
-
-    // Fused: copy hidden → residual AND RMSNorm → norm_out
-    half* norm_out = state_.ffn_out;
-    launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
-                         state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
-
-    // QKV projections — fused when all 3 are NF4
-    if (!layer.q_proj_fp16 && !layer.k_proj_fp16 && !layer.v_proj_fp16) {
-        auto& q = layer.q_proj_nf4; auto& k = layer.k_proj_nf4; auto& v = layer.v_proj_nf4;
-        launch_nf4_fused_3(
-            q.data, q.absmax, state_.q_buf, q.out_dim,
-            k.data, k.absmax, state_.k_buf, k.out_dim,
-            v.data, v.absmax, state_.v_buf, v.out_dim,
-            norm_out, q.in_dim, stream);
-    } else {
-        if (layer.q_proj_fp16) cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
-        else { auto& w = layer.q_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.q_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-        if (layer.k_proj_fp16) cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
-        else { auto& w = layer.k_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.k_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-        if (layer.v_proj_fp16) cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
-        else { auto& w = layer.v_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.v_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-    }
-
-    // Fused QKNorm
-    launch_qk_norm(state_.q_buf, state_.k_buf, layer.q_norm, layer.k_norm,
-                   NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, RMS_NORM_EPS, stream);
-
-    // RoPE (reads position from device memory)
-    launch_rope_device(state_.q_buf, state_.k_buf,
-                       state_.rope_cos, state_.rope_sin, state_.d_pos,
-                       NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
-
-    // KV cache write (reads position from device memory)
-    launch_kv_cache_write(kv.key, kv.value, state_.k_buf, state_.v_buf,
-                           state_.d_pos, KV_DIM, stream);
-
-    // GQA Attention (reads position from device memory)
-    launch_gqa_attention_device(state_.q_buf, kv.key, kv.value, state_.attn_out,
-                                 state_.attn_scores, state_.d_pos,
-                                 state_.max_seq_len,
-                                 NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, stream);
-
-    // Output projection (fp16 or NF4)
-    if (layer.o_proj_fp16) cublas_hgemv_lora(layer.o_proj_fp16, state_.attn_out, state_.hidden, HIDDEN_SIZE, Q_DIM, layer.lora_o, state_.lora_scratch);
-    else { auto& w = layer.o_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, state_.attn_out, state_.hidden, w.out_dim, w.in_dim, w.block_size, stream); }
-
-    // Residual add
-    launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
-
-    // Post-attention: copy hidden → residual AND RMSNorm → norm_out
-    launch_copy_rms_norm(state_.hidden, layer.post_attn_layernorm,
-                         state_.residual, norm_out, HIDDEN_SIZE, RMS_NORM_EPS, stream);
-
-    // Gate + Up — fused when both NF4
-    if (!layer.gate_proj_fp16 && !layer.up_proj_fp16) {
-        auto& g = layer.gate_proj_nf4; auto& u = layer.up_proj_nf4;
-        launch_nf4_fused_2(
-            g.data, g.absmax, state_.gate_buf, g.out_dim,
-            u.data, u.absmax, state_.up_buf, u.out_dim,
-            norm_out, g.in_dim, stream);
-    } else {
-        if (layer.gate_proj_fp16) cublas_hgemv_lora(layer.gate_proj_fp16, norm_out, state_.gate_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, layer.lora_gate, state_.lora_scratch);
-        else { auto& w = layer.gate_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.gate_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-        if (layer.up_proj_fp16) cublas_hgemv_lora(layer.up_proj_fp16, norm_out, state_.up_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, layer.lora_up, state_.lora_scratch);
-        else { auto& w = layer.up_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, norm_out, state_.up_buf, w.out_dim, w.in_dim, w.block_size, stream); }
-    }
-    launch_silu_gate_mul(state_.gate_buf, state_.up_buf, state_.gate_buf, INTERMEDIATE_SIZE, stream);
-    if (layer.down_proj_fp16) cublas_hgemv_lora(layer.down_proj_fp16, state_.gate_buf, state_.hidden, HIDDEN_SIZE, INTERMEDIATE_SIZE, layer.lora_down, state_.lora_scratch);
-    else { auto& w = layer.down_proj_nf4; launch_nf4_gemv_fast(w.data, w.absmax, state_.gate_buf, state_.hidden, w.out_dim, w.in_dim, w.block_size, stream); }
-
-    launch_residual_add(state_.hidden, state_.residual, HIDDEN_SIZE, stream);
-}
-
-// ============================================================================
-// CUDA Graph capture and replay
-// ============================================================================
-
-void InferenceEngine::enable_cuda_graph() {
-    if (graph_captured_) return;
-
-    // Create a dedicated stream for graph capture
-    cudaStreamCreate(&graph_stream_);
-
-    // Set cuBLAS to use our stream
-    cublasSetStream(cublas_handle, graph_stream_);
-
-    // Warm up: run one full decode on the graph stream
-    int warmup_token = 0;
-    cudaMemcpy(state_.d_token_id, &warmup_token, sizeof(int), cudaMemcpyHostToDevice);
-    int warmup_pos = state_.current_pos;
-    cudaMemcpy(state_.d_pos, &warmup_pos, sizeof(int), cudaMemcpyHostToDevice);
-
-    // Embedding (device-side token id)
-    launch_embedding_device(weights_.embed_tokens, state_.d_token_id,
-                             state_.hidden, HIDDEN_SIZE, graph_stream_);
-    for (int i = 0; i < NUM_LAYERS; i++) {
-        forward_layer_graph(i, graph_stream_);
-    }
-    half* norm_out = state_.ffn_out;
-    launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
-                    HIDDEN_SIZE, RMS_NORM_EPS, graph_stream_);
-
-    // LM head: always cuBLAS fp16 (2x faster than NF4 GEMV for this large matrix)
-    auto lm_head_on_stream = [&](cudaStream_t s) {
-        float alpha = 1.0f, beta = 0.0f;
-        cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                     VOCAB_SIZE, 1, HIDDEN_SIZE, &alpha,
-                     weights_.embed_tokens, CUDA_R_16F, HIDDEN_SIZE,
-                     norm_out, CUDA_R_16F, HIDDEN_SIZE,
-                     &beta, state_.logits, CUDA_R_32F, VOCAB_SIZE,
-                     CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    };
-
-    lm_head_on_stream(graph_stream_);
-    cudaStreamSynchronize(graph_stream_);
-
-    // Now capture
-    cudaStreamBeginCapture(graph_stream_, cudaStreamCaptureModeGlobal);
-
-    launch_embedding_device(weights_.embed_tokens, state_.d_token_id,
-                             state_.hidden, HIDDEN_SIZE, graph_stream_);
-    for (int i = 0; i < NUM_LAYERS; i++) {
-        forward_layer_graph(i, graph_stream_);
-    }
-    launch_rms_norm(state_.hidden, weights_.final_layernorm, norm_out,
-                    HIDDEN_SIZE, RMS_NORM_EPS, graph_stream_);
-    lm_head_on_stream(graph_stream_);
-
-    cudaStreamEndCapture(graph_stream_, &cuda_graph_);
-    cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, nullptr, nullptr, 0);
-
-    // Keep cuBLAS on graph_stream_ for replay (LM head + fp16 projections)
-    // This ensures cuBLAS operations are part of the graph replay
-    // (cuBLAS stream is NOT restored to 0 — all ops use graph_stream_ when graph is active)
-
-    graph_captured_ = true;
-    use_cuda_graph_ = true;
-    std::cout << "  CUDA graph captured for decode step" << std::endl;
-}
-
-// ============================================================================
-// Graph-accelerated decode
-// ============================================================================
-
-void InferenceEngine::decode_graph(int token_id) {
-    if (!graph_captured_) {
-        enable_cuda_graph();
-    }
-
-    // Async update device-side control values via pinned memory
-    // (pinned memory ensures cudaMemcpyAsync is truly async)
-    *h_token_id_pinned_ = token_id;
-    *h_pos_pinned_ = state_.current_pos;
-    cudaMemcpyAsync(state_.d_token_id, h_token_id_pinned_, sizeof(int),
-                    cudaMemcpyHostToDevice, graph_stream_);
-    cudaMemcpyAsync(state_.d_pos, h_pos_pinned_, sizeof(int),
-                    cudaMemcpyHostToDevice, graph_stream_);
-
-    // Replay the captured graph (all on graph_stream_, fully pipelined)
-    cudaGraphLaunch(cuda_graph_exec_, graph_stream_);
-    // NO sync here — let GPU run while CPU prepares next token
-    // Sync happens in sample_gpu() when reading the result
-
-    state_.current_pos++;
-}
-
-// ============================================================================
-// GPU-side greedy sampling (no CPU copy)
-// ============================================================================
-
-// ============================================================================
 // LoRA weight sync from PyTorch
 // ============================================================================
 
@@ -895,11 +691,7 @@ void InferenceEngine::update_lora_weight(
 }
 
 int InferenceEngine::sample_greedy_gpu() {
-    // Use graph_stream_ if CUDA graph is active, otherwise default stream
-    cudaStream_t s = use_cuda_graph_ ? graph_stream_ : 0;
-    launch_argmax(state_.logits, state_.sample_result, VOCAB_SIZE, s);
-    // Sync the specific stream and copy result
-    if (s) cudaStreamSynchronize(s);
+    launch_argmax(state_.logits, state_.sample_result, VOCAB_SIZE, 0);
     int result;
     cudaMemcpy(&result, state_.sample_result, sizeof(int), cudaMemcpyDeviceToHost);
     return result;
@@ -914,15 +706,10 @@ int InferenceEngine::sample_gpu(float temperature, float top_p) {
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float r = dist(rng);
 
-    // Use graph_stream_ if CUDA graph is active, otherwise default stream
-    cudaStream_t s = use_cuda_graph_ ? graph_stream_ : 0;
-
     // GPU kernel: temperature + softmax + cumulative sample
     // NOTE: this modifies logits in-place (they become probabilities)
     launch_gpu_sample(state_.logits, state_.sample_result, VOCAB_SIZE,
-                      temperature, r, top_p, s);
-    // Sync the specific stream and copy result
-    if (s) cudaStreamSynchronize(s);
+                      temperature, r, top_p, 0);
     int result;
     cudaMemcpy(&result, state_.sample_result, sizeof(int), cudaMemcpyDeviceToHost);
     return result;
@@ -1037,15 +824,7 @@ std::vector<int> InferenceEngine::generate(
     int token = sample_gpu(temperature, top_p);
     std::vector<int> output = {token};
 
-    // CUDA graph disabled for NF4 on Jetson Orin: graph replay is 14% slower
-    // than the non-graph path because sample→decode serialization prevents
-    // CPU pipelining. The non-graph path benefits from 0.5ms of CPU kernel
-    // submission overlapping with GPU execution.
-    // if (!graph_captured_ && prompt.size() > 0) {
-    //     enable_cuda_graph();
-    // }
-
-    // Decode loop (CUDA graph replay, no Python, all GPU sampling)
+    // Decode loop (all GPU sampling, no Python per token)
     for (int i = 0; i < max_new_tokens - 1; i++) {
         if (token == eos_token_id) break;
 
@@ -1063,11 +842,7 @@ std::vector<int> InferenceEngine::generate(
         }
         if (should_stop) break;
 
-        if (use_cuda_graph_) {
-            decode_graph(token);
-        } else {
-            decode(token);
-        }
+        decode(token);
         token = sample_gpu(temperature, top_p);
         output.push_back(token);
     }
@@ -1224,7 +999,6 @@ void InferenceEngine::decode_batch(int G) {
     // Embedding
     launch_embed_batch(B->hidden, weights_.embed_tokens, B->d_tokens, G, HIDDEN_SIZE, stream);
 
-
     // Forward layers
     for (int i = 0; i < NUM_LAYERS; i++)
         forward_layer_batch(i, G, stream);
@@ -1253,14 +1027,7 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
     int G = prompts.size();
     int max_prompt_len = 0;
     for (auto& p : prompts) max_prompt_len = std::max(max_prompt_len, (int)p.size());
-    // Cap total sequence length to avoid OOM from KV cache
-    // G=4, seq=600, 28 layers: ~275MB KV cache. Max ~620 to stay under budget.
-    int total_max_len = std::min(max_prompt_len + max_new_tokens, 620);
-    int effective_max_tokens = total_max_len - max_prompt_len;
-    if (effective_max_tokens < max_new_tokens) {
-        // Silently reduce completion length to fit memory budget
-        max_new_tokens = std::max(effective_max_tokens, 64);
-    }
+    int total_max_len = max_prompt_len + max_new_tokens;
 
     alloc_batch(G, total_max_len);
     auto* B = batch_;

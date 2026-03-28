@@ -17,8 +17,7 @@ from config import *
 # Import the custom trainer's grpo_train API
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import argparse
-from train import train
+from train import grpo_train, get_gsm8k_dataset, format_reward, correctness_reward
 
 
 def main():
@@ -28,34 +27,33 @@ def main():
     print(f"  Steps: {BENCHMARK_STEPS}")
     print("=" * 60)
 
-    # Build args namespace matching train.py expectations
-    args = argparse.Namespace(
-        model=MODEL,
-        lora_rank=LORA_RANK,
-        gradient_checkpointing=GRADIENT_CHECKPOINTING,
-        max_steps=BENCHMARK_STEPS,
-        lr=LEARNING_RATE,
-        max_grad_norm=MAX_GRAD_NORM,
-        warmup_ratio=WARMUP_RATIO,
-        num_generations=NUM_GENERATIONS,
-        max_completion_tokens=MAX_COMPLETION_TOKENS,
-        temperature=TEMPERATURE,
-        top_p=TOP_P,
-        epsilon=EPSILON,
-        epsilon_high=EPSILON * 2,  # DAPO uses wider upper clip
-        loss_type=LOSS_TYPE,
-        mask_truncated=MASK_TRUNCATED,
-        output_dir="/tmp/bench_ours",
-        logging_steps=1,
-        save_steps=9999,  # don't save during benchmark
-        dry_run=False,
-        _dataset=None,
-        _reward_funcs=None,
-        _stop_texts=None,
-    )
+    dataset = get_gsm8k_dataset()
 
     t0 = time.time()
-    train(args)
+    grpo_train(
+        dataset=dataset,
+        reward_funcs=[format_reward, correctness_reward],
+        model=MODEL,
+        max_steps=BENCHMARK_STEPS,
+        num_generations=NUM_GENERATIONS,
+        max_completion_tokens=MAX_COMPLETION_TOKENS,
+        lr=LEARNING_RATE,
+        lora_rank=LORA_RANK,
+        loss_type=LOSS_TYPE,
+        output_dir="/tmp/bench_ours",
+        dry_run=False,
+        stop_texts=["</answer>"],
+        epsilon=EPSILON,
+        epsilon_high=EPSILON * 2,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
+        max_grad_norm=MAX_GRAD_NORM,
+        warmup_ratio=WARMUP_RATIO,
+        gradient_checkpointing=GRADIENT_CHECKPOINTING,
+        mask_truncated=MASK_TRUNCATED,
+        logging_steps=1,
+        save_steps=9999,
+    )
     elapsed = time.time() - t0
 
     avg_step = elapsed / BENCHMARK_STEPS

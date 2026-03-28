@@ -437,15 +437,6 @@ void launch_nf4_gemv_fast(
     nf4_gemv_fast_kernel<<<nb, THREADS_PER_BLOCK, 0, s>>>(p, a, x, y, id, od, bs, 0);
 }
 
-// Q4 Linear variant (no lookup table)
-void launch_q4l_gemv(
-    const uint8_t* p, const float* scales, const half* x, half* y,
-    int od, int id, int bs, cudaStream_t s
-) {
-    int nb = (od + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
-    nf4_gemv_fast_kernel<<<nb, THREADS_PER_BLOCK, 0, s>>>(p, scales, x, y, id, od, bs, 1);
-}
-
 void launch_nf4_fused_2(
     const uint8_t* aw, const float* aa, half* ay, int ad,
     const uint8_t* bw, const float* ba, half* by, int bd,

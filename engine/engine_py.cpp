@@ -74,9 +74,6 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("A"), py::arg("B"), py::arg("scale") = 1.0f,
              "Update a single LoRA adapter (pass numpy fp16 arrays)")
 
-        .def("enable_cuda_graph", &InferenceEngine::enable_cuda_graph,
-             "Capture CUDA graph for decode step (call after first prefill)")
-
         .def("decode_token", &InferenceEngine::decode,
              py::arg("token_id"),
              "Process one token through the model")

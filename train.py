@@ -161,7 +161,6 @@ def grpo_step(model, optimizer, scaler, samples, config):
                      and s["advantage"] != 0.0]
     n_valid = len(valid_samples)
     if n_valid == 0:
-        optimizer.zero_grad()
         return 0.0
 
     total_loss_val = 0.0
@@ -219,22 +218,19 @@ def grpo_step(model, optimizer, scaler, samples, config):
         torch.cuda.empty_cache()
 
     # Gradient clipping + optimizer step
-    if n_valid > 0:
-        scaler.unscale_(optimizer)
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad],
-            config.max_grad_norm,
-        )
-        if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
-            print(f"  WARNING: NaN/Inf gradient norm, skipping step")
-            optimizer.zero_grad()
-            return float('nan')
-        scaler.step(optimizer)
-        scaler.update()
-    else:
+    scaler.unscale_(optimizer)
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        [p for p in model.parameters() if p.requires_grad],
+        config.max_grad_norm,
+    )
+    if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
+        print(f"  WARNING: NaN/Inf gradient norm, skipping step")
         optimizer.zero_grad()
+        return float('nan')
+    scaler.step(optimizer)
+    scaler.update()
 
-    return total_loss_val / max(n_valid, 1)
+    return total_loss_val / n_valid
 
 
 # ── Generation ──

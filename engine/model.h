@@ -44,7 +44,11 @@ struct ModelConfig {
     static ModelConfig from_json(const std::string& path);
 };
 
-// NF4 quantized weight: stored as uint8 (2 values per byte) + quantization metadata
+// 4-bit quantized weight: used for both NF4 (non-linear, lookup table) and Q4L
+// (linear, (nibble - 8) * scale) formats. The format is determined by the
+// is_q4l flags on TransformerLayerWeights and ModelWeights, not by this struct.
+// For NF4: absmax stores per-block absmax values, dequant uses quant_map lookup.
+// For Q4L: absmax stores per-block scale factors, dequant is linear arithmetic.
 struct NF4Weight {
     uint8_t* data;          // packed NF4 values (2 per byte), on GPU
     float* absmax;          // per-block scale factors (float32, pre-dequantized), on GPU
@@ -186,10 +190,6 @@ struct InferenceState {
 
     // LoRA scratch buffer (for A @ x intermediate, max rank = 64)
     half* lora_scratch; // (max_lora_rank,)
-
-    // CUDA graph: device-side control values (updated before graph replay)
-    int* d_token_id;    // current token id (for embedding lookup)
-    int* d_pos;         // current position (for RoPE, attention, KV cache)
 };
 
 // Batched generation state (G sequences in parallel)
@@ -290,10 +290,6 @@ public:
         float top_p = 0.9f,
         int eos_token_id = -1);
 
-    // CUDA graph for fast decode replay
-    bool use_cuda_graph_ = false;
-    void enable_cuda_graph();  // capture after first decode
-
     const ModelConfig& config() const { return config_; }
 
 private:
@@ -301,24 +297,8 @@ private:
     ModelWeights weights_;
     InferenceState state_;
 
-    // CUDA graph state
-    cudaGraph_t cuda_graph_ = nullptr;
-    cudaGraphExec_t cuda_graph_exec_ = nullptr;
-    bool graph_captured_ = false;
-    cudaStream_t graph_stream_ = nullptr;
-
-    // Pinned host memory for async graph control updates
-    int* h_token_id_pinned_ = nullptr;
-    int* h_pos_pinned_ = nullptr;
-
     // Forward pass for one token through one layer
     void forward_layer(int layer_idx);
-
-    // Graph-captured forward (uses device-side position)
-    void forward_layer_graph(int layer_idx, cudaStream_t stream);
-
-    // Graph-accelerated decode (capture on first call, replay after)
-    void decode_graph(int token_id);
 
     // Allocate GPU buffers (called from load_weights after config is known)
     void allocate_buffers();

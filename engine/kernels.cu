@@ -122,102 +122,6 @@ __global__ void copy_rms_norm_kernel(
     }
 }
 
-// Fused: copy + RMSNorm + q8 quantization in one kernel (saves 1 launch + 2KB round-trip)
-__global__ void copy_rms_norm_q8_kernel(
-    const half* __restrict__ input,
-    const half* __restrict__ weight,
-    half* __restrict__ residual,
-    half* __restrict__ norm_out,
-    int8_t* __restrict__ q8_data,     // output: quantized norm_out
-    float* __restrict__ q8_scales,    // output: per-block scale
-    float* __restrict__ q8_sums,      // output: per-block sum
-    int dim, float eps
-) {
-    // Pass 1: copy + sum of squares
-    float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        half val_h = input[i];
-        residual[i] = val_h;
-        float val = __half2float(val_h);
-        sum_sq += val * val;
-    }
-
-    for (int offset = warpSize / 2; offset > 0; offset /= 2)
-        sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
-    __shared__ float shared[32];
-    int warp_id = threadIdx.x / warpSize;
-    int lane_id = threadIdx.x % warpSize;
-    if (lane_id == 0) shared[warp_id] = sum_sq;
-    __syncthreads();
-    if (warp_id == 0) {
-        sum_sq = (lane_id < (blockDim.x + warpSize - 1) / warpSize) ? shared[lane_id] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset /= 2)
-            sum_sq += __shfl_down_sync(0xFFFFFFFF, sum_sq, offset);
-        if (lane_id == 0) shared[0] = sum_sq;
-    }
-    __syncthreads();
-    float rms = rsqrtf(shared[0] / dim + eps);
-
-    // Pass 2: normalize, write fp16, AND quantize to int8
-    // Process in 64-element blocks for q8 quantization
-    const int block_size = 64;
-    int n_blocks = dim / block_size;
-
-    for (int blk = 0; blk < n_blocks; blk++) {
-        int base = blk * block_size;
-
-        // Find max abs in this q8 block (all threads participate)
-        float my_max = 0.0f;
-        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
-            float val = __half2float(input[base + i]) * rms * __half2float(weight[base + i]);
-            my_max = fmaxf(my_max, fabsf(val));
-        }
-        // Quick warp reduce for max (single block, all threads)
-        for (int off = warpSize / 2; off > 0; off /= 2)
-            my_max = fmaxf(my_max, __shfl_down_sync(0xFFFFFFFF, my_max, off));
-        if (lane_id == 0) shared[warp_id] = my_max;
-        __syncthreads();
-        if (warp_id == 0) {
-            my_max = (lane_id < (blockDim.x + 31) / 32) ? shared[lane_id] : 0.0f;
-            for (int off = warpSize / 2; off > 0; off /= 2)
-                my_max = fmaxf(my_max, __shfl_down_sync(0xFFFFFFFF, my_max, off));
-            if (lane_id == 0) shared[0] = my_max;
-        }
-        __syncthreads();
-
-        float scale = shared[0] / 127.0f;
-        if (scale < 1e-10f) scale = 1e-10f;
-        float inv_scale = 1.0f / scale;
-
-        // Normalize, write fp16, quantize to int8, compute sum
-        int my_sum = 0;
-        for (int i = threadIdx.x; i < block_size; i += blockDim.x) {
-            float val = __half2float(input[base + i]) * rms * __half2float(weight[base + i]);
-            norm_out[base + i] = __float2half(val);
-            int q = __float2int_rn(val * inv_scale);
-            q = max(-127, min(127, q));
-            q8_data[base + i] = (int8_t)q;
-            my_sum += q;
-        }
-
-        // Reduce sum for this block
-        for (int off = warpSize / 2; off > 0; off /= 2)
-            my_sum += __shfl_down_sync(0xFFFFFFFF, my_sum, off);
-        if (lane_id == 0) shared[warp_id] = (float)my_sum;
-        __syncthreads();
-        if (warp_id == 0) {
-            float s = (lane_id < (blockDim.x + 31) / 32) ? shared[lane_id] : 0.0f;
-            for (int off = warpSize / 2; off > 0; off /= 2)
-                s += __shfl_down_sync(0xFFFFFFFF, s, off);
-            if (lane_id == 0) {
-                q8_scales[blk] = scale;
-                q8_sums[blk] = s;
-            }
-        }
-        __syncthreads();
-    }
-}
-
 // ============================================================================
 // Kernel 2b: Fused QKNorm (RMSNorm applied per-head to Q and K)
 // ============================================================================
@@ -279,51 +183,6 @@ __global__ void qk_norm_kernel(
 // Kernel 3: RoPE (Rotary Position Embedding)
 // ============================================================================
 // Apply rotation to Q and K vectors in-place.
-
-// RoPE that reads position from device memory (for CUDA graph)
-__global__ void rope_device_kernel(
-    half* __restrict__ q,
-    half* __restrict__ k,
-    const half* __restrict__ cos_table_base,  // full table: (max_seq, HEAD_DIM/2)
-    const half* __restrict__ sin_table_base,
-    const int* __restrict__ d_pos,            // device-side position
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim
-) {
-    int pos = *d_pos;
-    int half_head = head_dim / 2;
-    const half* cos_table = cos_table_base + pos * half_head;
-    const half* sin_table = sin_table_base + pos * half_head;
-
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_q = num_q_heads * half_head;
-
-    if (idx < total_q) {
-        int head = idx / half_head;
-        int d = idx % half_head;
-        int base = head * head_dim;
-        float q0 = __half2float(q[base + d]);
-        float q1 = __half2float(q[base + d + half_head]);
-        float c = __half2float(cos_table[d]);
-        float s = __half2float(sin_table[d]);
-        q[base + d] = __float2half(q0 * c - q1 * s);
-        q[base + d + half_head] = __float2half(q1 * c + q0 * s);
-    }
-
-    int total_kv = num_kv_heads * half_head;
-    if (idx < total_kv) {
-        int head = idx / half_head;
-        int d = idx % half_head;
-        int base = head * head_dim;
-        float k0 = __half2float(k[base + d]);
-        float k1 = __half2float(k[base + d + half_head]);
-        float c = __half2float(cos_table[d]);
-        float s = __half2float(sin_table[d]);
-        k[base + d] = __float2half(k0 * c - k1 * s);
-        k[base + d + half_head] = __float2half(k1 * c + k0 * s);
-    }
-}
 
 __global__ void rope_kernel(
     half* __restrict__ q,       // (Q_DIM,) = (NUM_HEADS * HEAD_DIM,)
@@ -513,39 +372,6 @@ __global__ void embedding_lookup_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < hidden_dim) {
         output[idx] = embed_table[(size_t)token_id * hidden_dim + idx];
-    }
-}
-
-// Version that reads token_id from device memory (for CUDA graph capture)
-__global__ void embedding_lookup_device_kernel(
-    const half* __restrict__ embed_table,
-    const int* __restrict__ d_token_id,     // device-side token id
-    half* __restrict__ output,
-    int hidden_dim
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < hidden_dim) {
-        output[idx] = embed_table[(size_t)(*d_token_id) * hidden_dim + idx];
-    }
-}
-
-// ============================================================================
-// Kernel 6b: KV cache write (reads position from device memory for CUDA graph)
-// ============================================================================
-
-__global__ void kv_cache_write_kernel(
-    half* __restrict__ k_cache,     // (max_seq, KV_DIM)
-    half* __restrict__ v_cache,     // (max_seq, KV_DIM)
-    const half* __restrict__ k_new, // (KV_DIM,)
-    const half* __restrict__ v_new, // (KV_DIM,)
-    const int* __restrict__ d_pos,
-    int kv_dim
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int pos = *d_pos;
-    if (idx < kv_dim) {
-        k_cache[pos * kv_dim + idx] = k_new[idx];
-        v_cache[pos * kv_dim + idx] = v_new[idx];
     }
 }
 
@@ -871,16 +697,6 @@ void launch_copy_rms_norm(
     copy_rms_norm_kernel<<<1, 256, 0, stream>>>(input, weight, residual, norm_out, dim, eps);
 }
 
-void launch_copy_rms_norm_q8(
-    const half* input, const half* weight,
-    half* residual, half* norm_out,
-    int8_t* q8_data, float* q8_scales, float* q8_sums,
-    int dim, float eps, cudaStream_t stream
-) {
-    copy_rms_norm_q8_kernel<<<1, 256, 0, stream>>>(
-        input, weight, residual, norm_out, q8_data, q8_scales, q8_sums, dim, eps);
-}
-
 void launch_qk_norm(
     half* q, half* k,
     const half* q_weight, const half* k_weight,
@@ -936,58 +752,6 @@ void launch_silu_gate_mul(
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
     silu_gate_mul_kernel<<<blocks, threads, 0, stream>>>(gate, up, output, dim);
-}
-
-void launch_embedding_device(
-    const half* embed_table, const int* d_token_id,
-    half* output, int hidden_dim, cudaStream_t stream
-) {
-    int threads = 256;
-    int blocks = (hidden_dim + threads - 1) / threads;
-    embedding_lookup_device_kernel<<<blocks, threads, 0, stream>>>(
-        embed_table, d_token_id, output, hidden_dim
-    );
-}
-
-void launch_rope_device(
-    half* q, half* k,
-    const half* cos_table_base, const half* sin_table_base,
-    const int* d_pos,
-    int num_heads, int num_kv_heads, int head_dim,
-    cudaStream_t stream
-) {
-    int n = num_heads * head_dim / 2;
-    int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    rope_device_kernel<<<blocks, threads, 0, stream>>>(
-        q, k, cos_table_base, sin_table_base, d_pos,
-        num_heads, num_kv_heads, head_dim
-    );
-}
-
-void launch_gqa_attention_device(
-    const half* q, const half* k_cache, const half* v_cache,
-    half* output, float* attn_scratch, const int* d_pos,
-    int max_seq_len,
-    int num_heads, int num_kv_heads, int head_dim,
-    cudaStream_t stream
-) {
-    gqa_attention_decode_kernel<<<num_heads, 128, 0, stream>>>(
-        q, k_cache, v_cache, output, attn_scratch, d_pos, 0,
-        max_seq_len, num_heads, num_kv_heads, head_dim
-    );
-}
-
-void launch_kv_cache_write(
-    half* k_cache, half* v_cache,
-    const half* k_new, const half* v_new,
-    const int* d_pos, int kv_dim, cudaStream_t stream
-) {
-    int threads = 256;
-    int blocks = (kv_dim + threads - 1) / threads;
-    kv_cache_write_kernel<<<blocks, threads, 0, stream>>>(
-        k_cache, v_cache, k_new, v_new, d_pos, kv_dim
-    );
 }
 
 void launch_embedding(
