@@ -207,13 +207,16 @@ def grpo_step(model, optimizer, scaler, samples, config):
         scaler.scale(sample_loss / n_valid).backward()
         total_loss_val += loss_val
 
-        # Free all intermediates (no empty_cache — allocator reuses blocks)
+        # Free intermediates + flush CUDA allocator
+        # empty_cache() IS needed on Jetson unified memory to prevent fragmentation
+        # that causes OOM after ~8 steps. On discrete GPUs this can be removed.
         del outputs, logits, new_lp, input_tensor, sample_loss
         del ratio, per_token_loss, new_comp_lp
         if config.loss_type == "grpo":
             del surr1, surr2
         else:
             del clipped_ratio
+        torch.cuda.empty_cache()
 
     # Gradient clipping + optimizer step
     if n_valid > 0:
