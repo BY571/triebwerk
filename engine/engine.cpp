@@ -40,15 +40,14 @@ static cublasHandle_t cublas_handle = nullptr;
 static void* cublas_workspace = nullptr;
 static const size_t CUBLAS_WORKSPACE_SIZE = 4 * 1024 * 1024; // 4MB
 
-static void ensure_cublas() {
+static void ensure_cublas(cudaStream_t stream = 0) {
     if (!cublas_handle) {
         cublasCreate(&cublas_handle);
         cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
-        cublasSetStream(cublas_handle, 0);
-        // Pre-allocate workspace to prevent cuBLAS from fighting PyTorch's allocator
         cudaMalloc(&cublas_workspace, CUBLAS_WORKSPACE_SIZE);
         cublasSetWorkspace(cublas_handle, cublas_workspace, CUBLAS_WORKSPACE_SIZE);
     }
+    cublasSetStream(cublas_handle, stream);
 }
 
 // cuBLAS fp16 GEMV with optional LoRA: y = W @ x + scale * B @ (A @ x)
@@ -211,13 +210,13 @@ ModelConfig ModelConfig::from_json(const std::string& path) {
 // ============================================================================
 
 InferenceEngine::InferenceEngine(int max_seq_len) {
-    // Config and buffers are allocated in load_weights() when we know the model dims.
-    // Here we just store max_seq_len and zero-init pointers.
     config_ = ModelConfig::qwen3_0_6b(); // default, overwritten by load_weights
     state_ = {};
     state_.max_seq_len = max_seq_len;
     state_.current_pos = 0;
     batch_ = nullptr;
+    // Dedicated stream so graph capture doesn't interfere with PyTorch
+    cudaStreamCreate(&engine_stream_);
 }
 
 void InferenceEngine::allocate_buffers() {
@@ -288,13 +287,16 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(state_.q8_sums);
     cudaFree(state_.lora_scratch);
 
-    // Free batch state (GPU memory is in arena, not individual mallocs)
+    // Free batch state
     if (batch_) {
         delete[] batch_->h_positions; delete[] batch_->h_tokens;
         delete[] batch_->h_finished; delete[] batch_->h_randoms;
         delete batch_;
     }
     if (batch_arena_.base) cudaFree(batch_arena_.base);
+    if (decode_graph_exec_) cudaGraphExecDestroy(decode_graph_exec_);
+    if (decode_graph_) cudaGraphDestroy(decode_graph_);
+    if (engine_stream_) cudaStreamDestroy(engine_stream_);
 }
 
 // ============================================================================
@@ -360,6 +362,10 @@ void InferenceEngine::sleep() {
         batch_arena_.capacity = 0;
         batch_arena_.offset = 0;
     }
+    // Invalidate CUDA graph (buffer pointers changed)
+    if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
+    if (decode_graph_) { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
+    graph_G_ = 0;
 
     // Free single-sequence KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
@@ -736,11 +742,15 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     add(G * sizeof(float)); // d_randoms
     add(64 * G * sizeof(half)); // lora_scratch
 
-    // (Re)allocate arena if needed
+    // (Re)allocate arena if needed -- invalidates CUDA graph (stale pointers)
     if (need > batch_arena_.capacity) {
         if (batch_arena_.base) cudaFree(batch_arena_.base);
         CUDA_CHECK(cudaMalloc(&batch_arena_.base, need));
         batch_arena_.capacity = need;
+        // Invalidate graph since buffer pointers changed
+        if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
+        if (decode_graph_) { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
+        graph_G_ = 0;
     }
     batch_arena_.reset();
 
@@ -786,7 +796,7 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
 
 void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
                                   int M, int N, int K, cudaStream_t stream) {
-    ensure_cublas();
+    ensure_cublas(stream);
     // weight is (M, K) row-major = (K, M) col-major for cuBLAS
     // in is (K, N) col-major, out is (M, N) col-major
     // Use fp32 accumulation for precision (fp16 loses accuracy for K=1024+)
@@ -846,7 +856,7 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
         else batch_gemm_q4l(out, nf4w, input, G, stream);
         // LoRA: out += scale * B @ (A @ input)
         if (lora && lora->A && lora->B) {
-            ensure_cublas();
+            ensure_cublas(stream);
             // scratch = A @ input: (rank, in_dim) @ (in_dim, G) -> (rank, G)
             float alpha = 1.0f, beta = 0.0f;
             cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -918,7 +928,7 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
 }
 
 void InferenceEngine::decode_batch(int G) {
-    cudaStream_t stream = 0;
+    cudaStream_t stream = engine_stream_;
     auto* B = batch_;
 
     // Embedding
@@ -934,7 +944,7 @@ void InferenceEngine::decode_batch(int G) {
 
     // LM head: (VOCAB_SIZE, HIDDEN_SIZE) @ (HIDDEN_SIZE, G) -> (VOCAB_SIZE, G) in fp32
     {
-        ensure_cublas();
+        ensure_cublas(stream);
         float alpha = 1.0f, beta = 0.0f;
         cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
                      VOCAB_SIZE, G, HIDDEN_SIZE, &alpha,
@@ -980,20 +990,98 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
             if (t < (int)prompts[g].size()) B->h_positions[g]++;
     }
 
-    // Phase 2: Decode (generate new tokens)
-    for (int step = 0; step < max_new_tokens; step++) {
-        // Sample from logits (temperature + top-p, or greedy)
-        if (temperature < 0.01f) {
-            launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, 0);
-        } else {
-            // Generate G random values on CPU (fast enough for small G)
-            static std::mt19937 batch_rng(42);
-            std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-            for (int g = 0; g < G; g++) B->h_randoms[g] = dist(batch_rng);
-            cudaMemcpy(B->d_randoms, B->h_randoms, G * sizeof(float), cudaMemcpyHostToDevice);
-            launch_sample_batch(B->logits, B->d_tokens, B->d_randoms,
-                                VOCAB_SIZE, G, temperature, top_p, 0);
+    // Try to capture CUDA graph for the decode loop (decode_batch + sampling)
+    // Skip for short warmup generations. Graph is auto-invalidated if arena reallocates.
+    bool use_graph = false;
+    if (G > 1 && max_new_tokens >= 50 && !(graph_G_ == G && decode_graph_exec_)) {
+        // Free old graph
+        if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
+        if (decode_graph_) { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
+        graph_G_ = 0;
+
+        // Warm up cuBLAS on engine_stream_ (allocates internal plans)
+        decode_batch(G);
+        if (temperature >= 0.01f)
+            launch_sample_batch(B->logits, B->d_tokens, B->d_randoms, VOCAB_SIZE, G, temperature, top_p, engine_stream_);
+        else
+            launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, engine_stream_);
+        cudaStreamSynchronize(engine_stream_);
+
+        // Capture on engine_stream_ (isolated from PyTorch's default stream)
+        cudaError_t cap_err = cudaStreamBeginCapture(engine_stream_, cudaStreamCaptureModeRelaxed);
+        if (cap_err == cudaSuccess) {
+            decode_batch(G);
+            if (temperature >= 0.01f)
+                launch_sample_batch(B->logits, B->d_tokens, B->d_randoms, VOCAB_SIZE, G, temperature, top_p, engine_stream_);
+            else
+                launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, engine_stream_);
+
+            cudaGraph_t captured = nullptr;
+            cap_err = cudaStreamEndCapture(engine_stream_, &captured);
+            if (cap_err == cudaSuccess && captured) {
+                cap_err = cudaGraphInstantiate(&decode_graph_exec_, captured, 0);
+                if (cap_err == cudaSuccess) {
+                    decode_graph_ = captured;
+                    graph_G_ = G;
+                    use_graph = true;
+                    std::cout << "  CUDA graph captured for decode (G=" << G << ")" << std::endl;
+                } else {
+                    cudaGraphDestroy(captured);
+                }
+            }
+            if (!use_graph) {
+                // EndCapture may have failed -- clear any CUDA error state
+                cudaGetLastError();
+                std::cerr << "  CUDA graph capture failed (err=" << (int)cap_err
+                          << "), using eager mode" << std::endl;
+            }
         }
+
+        // Warmup corrupted KV cache -- clear and redo entire prefill
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            cudaMemset(B->kv_keys[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+            cudaMemset(B->kv_values[i], 0, (size_t)G * total_max_len * KV_DIM * sizeof(half));
+        }
+        for (int g = 0; g < G; g++) B->h_positions[g] = 0;
+        for (int t = 0; t < max_prompt_len; t++) {
+            for (int g = 0; g < G; g++)
+                B->h_tokens[g] = (t < (int)prompts[g].size()) ? prompts[g][t] : 0;
+            cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
+            decode_batch(G);
+            for (int g = 0; g < G; g++)
+                if (t < (int)prompts[g].size()) B->h_positions[g]++;
+        }
+    } else if (graph_G_ == G && decode_graph_exec_) {
+        use_graph = true;
+    }
+
+    // Phase 2: Decode (generate new tokens)
+    // Flow: sample from current logits -> check stop -> update tokens/positions -> decode next
+    for (int step = 0; step < max_new_tokens; step++) {
+        // Sample (graph includes sampling, eager does it separately)
+        if (use_graph) {
+            if (temperature >= 0.01f) {
+                static std::mt19937 batch_rng(42);
+                std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+                for (int g = 0; g < G; g++) B->h_randoms[g] = dist(batch_rng);
+                cudaMemcpyAsync(B->d_randoms, B->h_randoms, G * sizeof(float), cudaMemcpyHostToDevice, engine_stream_);
+            }
+            CUDA_CHECK(cudaGraphLaunch(decode_graph_exec_, engine_stream_));
+        } else {
+            if (temperature < 0.01f) {
+                launch_argmax_batch(B->logits, B->d_tokens, VOCAB_SIZE, G, 0);
+            } else {
+                static std::mt19937 batch_rng(42);
+                std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+                for (int g = 0; g < G; g++) B->h_randoms[g] = dist(batch_rng);
+                cudaMemcpy(B->d_randoms, B->h_randoms, G * sizeof(float), cudaMemcpyHostToDevice);
+                launch_sample_batch(B->logits, B->d_tokens, B->d_randoms,
+                                    VOCAB_SIZE, G, temperature, top_p, 0);
+            }
+        }
+        // Sync engine_stream_ then read sampled tokens
+        cudaStreamSynchronize(engine_stream_);
         cudaMemcpy(B->h_tokens, B->d_tokens, G * sizeof(int), cudaMemcpyDeviceToHost);
 
         // Check stopping (eos + stop sequences)
@@ -1018,12 +1106,16 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         }
         if (all_done) break;
 
-        // Decode with sampled tokens at current positions
-        cudaMemcpy(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice);
-        decode_batch(G);
+        // Update tokens + positions on device for next decode step
+        // Use engine_stream_ so the graph sees updated values
+        cudaMemcpyAsync(B->d_tokens, B->h_tokens, G * sizeof(int), cudaMemcpyHostToDevice, engine_stream_);
+        cudaMemcpyAsync(B->d_positions, B->h_positions, G * sizeof(int), cudaMemcpyHostToDevice, engine_stream_);
+        if (!use_graph) {
+            decode_batch(G);
+        }
+        // (graph path: decode_batch is part of the graph launched at top of next iteration)
 
-        // Advance positions AFTER decode (matches single-sequence behavior)
+        // Advance positions AFTER decode
         for (int g = 0; g < G; g++)
             if (!B->h_finished[g]) B->h_positions[g]++;
     }

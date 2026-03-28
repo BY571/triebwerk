@@ -308,6 +308,14 @@ public:
 private:
     bool weights_cached_ = false;
     GpuArena batch_arena_;  // single allocation for all batch GPU buffers
+
+    // Dedicated stream for engine (avoids conflicts with PyTorch's default stream)
+    cudaStream_t engine_stream_ = nullptr;
+
+    // CUDA graph for batched decode (captured on first decode, replayed thereafter)
+    cudaGraph_t decode_graph_ = nullptr;
+    cudaGraphExec_t decode_graph_exec_ = nullptr;
+    int graph_G_ = 0;  // G used when graph was captured
     ModelConfig config_;
     ModelWeights weights_;
     InferenceState state_;

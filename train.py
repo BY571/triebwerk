@@ -392,9 +392,9 @@ def train(args):
         syncer = LoRASyncer(model, engine,
                             lora_alpha=args.lora_rank, lora_rank=args.lora_rank)
 
-        # Pre-allocate batch arena at max size (prompt + max completion tokens)
-        # Use a dummy prompt long enough to trigger max KV cache allocation
-        dummy_prompt = list(range(100))  # ~100 token prompt
+        # Pre-allocate batch arena at max possible size to prevent mid-training realloc
+        # (realloc invalidates CUDA graph). Use a long dummy prompt.
+        dummy_prompt = list(range(200))  # oversized prompt
         engine.generate_batch(
             [dummy_prompt] * args.num_generations,
             max_new_tokens=args.max_completion_tokens,
