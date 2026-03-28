@@ -53,6 +53,7 @@ struct NF4Weight {
     uint8_t* data;          // packed NF4 values (2 per byte), on GPU
     float* absmax;          // per-block scale factors (float32, pre-dequantized), on GPU
     float* quant_map;       // NF4 dequant lookup table (16 entries), on GPU
+    half* fp16_cache;       // pre-dequanted fp16 weights (nullptr = not cached)
     int out_dim;            // output dimension (rows)
     int in_dim;             // input dimension (cols)
     int block_size;         // typically 64
@@ -204,6 +205,9 @@ struct BatchState {
     // Q4L dequant scratch (largest projection = INTERMEDIATE_SIZE * HIDDEN_SIZE)
     half* dequant_scratch;
 
+    // LoRA scratch for batched A @ x intermediate (max_rank * G)
+    half* lora_scratch;
+
     // Per-sequence state
     int* h_positions;   // host (G,)
     int* d_positions;   // device (G,)
@@ -270,11 +274,16 @@ public:
         int max_new_tokens = 512,
         float temperature = 1.0f,
         float top_p = 0.9f,
-        int eos_token_id = -1);
+        int eos_token_id = -1,
+        const std::vector<int>& stop_token_ids = {});
+
+    // Pre-dequant Q4L weights to fp16 for fast batched GEMM
+    void cache_weights();
 
     const ModelConfig& config() const { return config_; }
 
 private:
+    bool weights_cached_ = false;
     ModelConfig config_;
     ModelWeights weights_;
     InferenceState state_;

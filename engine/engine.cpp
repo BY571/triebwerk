@@ -290,6 +290,7 @@ InferenceEngine::~InferenceEngine() {
         cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
         cudaFree(batch_->up_buf); cudaFree(batch_->logits);
         cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
+        cudaFree(batch_->lora_scratch);
         for (int i = 0; i < NUM_LAYERS; i++) {
             cudaFree(batch_->kv_keys[i]);
             cudaFree(batch_->kv_values[i]);
@@ -625,6 +626,7 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
         cudaFree(batch_->up_buf); cudaFree(batch_->logits);
         cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
+        cudaFree(batch_->lora_scratch);
         for (int i = 0; i < NUM_LAYERS; i++) {
             cudaFree(batch_->kv_keys[i]);
             cudaFree(batch_->kv_values[i]);
@@ -665,6 +667,8 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     batch_->h_finished = new bool[G]();
     batch_->h_randoms = new float[G]();
     CUDA_CHECK(cudaMalloc(&batch_->d_randoms, G * sizeof(float)));
+    // LoRA scratch: max_rank(64) * G
+    CUDA_CHECK(cudaMalloc(&batch_->lora_scratch, 64 * G * sizeof(half)));
 
     std::cout << "  Batch allocated: G=" << G << " max_seq=" << max_seq_len
               << " KV=" << (G * max_seq_len * KV_DIM * 2 * NUM_LAYERS * 2 / 1e6) << "MB" << std::endl;
@@ -685,33 +689,83 @@ void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
                  CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
+void InferenceEngine::cache_weights() {
+    if (weights_cached_ || !weights_.is_q4l) return;
+    size_t total_bytes = 0;
+    auto cache_one = [&](NF4Weight& w) {
+        if (!w.data || w.fp16_cache) return;
+        size_t sz = (size_t)w.out_dim * w.in_dim * sizeof(half);
+        CUDA_CHECK(cudaMalloc(&w.fp16_cache, sz));
+        launch_dequant_q4l(w.fp16_cache, w.data, w.absmax, w.out_dim, w.in_dim, 0);
+        total_bytes += sz;
+    };
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        auto& L = weights_.layers[i];
+        cache_one(L.q_proj_nf4); cache_one(L.k_proj_nf4);
+        cache_one(L.v_proj_nf4); cache_one(L.o_proj_nf4);
+        cache_one(L.gate_proj_nf4); cache_one(L.up_proj_nf4);
+        cache_one(L.down_proj_nf4);
+    }
+    cudaDeviceSynchronize();
+    weights_cached_ = true;
+    std::cout << "  Cached " << total_bytes / 1e6 << "MB dequanted weights" << std::endl;
+}
+
 void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
                                       int N, cudaStream_t stream) {
-    // Dequant Q4L to fp16 scratch, then use standard fp16 GEMM
-    // (fp32 mixed-type GEMM is CUBLAS_STATUS_NOT_SUPPORTED on Jetson Orin)
-    launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
-                       w.out_dim, w.in_dim, stream);
-    batch_gemm(out, (const half*)batch_->dequant_scratch, in,
-               w.out_dim, N, w.in_dim, stream);
+    if (w.fp16_cache) {
+        // Use pre-dequanted fp16 weights (no per-step dequant)
+        batch_gemm(out, w.fp16_cache, in, w.out_dim, N, w.in_dim, stream);
+    } else {
+        // Fallback: dequant to scratch each step
+        launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
+                           w.out_dim, w.in_dim, stream);
+        batch_gemm(out, (const half*)batch_->dequant_scratch, in,
+                   w.out_dim, N, w.in_dim, stream);
+    }
 }
 
 void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t stream) {
     auto& L = weights_.layers[layer_idx];
     auto* B = batch_;
 
+    // Batched projection: base GEMM + optional LoRA
+    auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input,
+                       int out_dim, int in_dim, const LoRAAdapter* lora) {
+        if (fp16w) batch_gemm(out, fp16w, input, out_dim, G, in_dim, stream);
+        else batch_gemm_q4l(out, nf4w, input, G, stream);
+        // LoRA: out += scale * B @ (A @ input)
+        if (lora && lora->A && lora->B) {
+            ensure_cublas();
+            // scratch = A @ input: (rank, in_dim) @ (in_dim, G) -> (rank, G)
+            float alpha = 1.0f, beta = 0.0f;
+            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                         lora->rank, G, lora->in_features, &alpha,
+                         lora->A, CUDA_R_16F, lora->in_features,
+                         input, CUDA_R_16F, lora->in_features,
+                         &beta, B->lora_scratch, CUDA_R_16F, lora->rank,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            // out += scale * B @ scratch: (out_dim, rank) @ (rank, G) -> (out_dim, G)
+            float one = 1.0f;
+            float scale = lora->scale;
+            cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                         lora->out_features, G, lora->rank, &scale,
+                         lora->B, CUDA_R_16F, lora->rank,
+                         B->lora_scratch, CUDA_R_16F, lora->rank,
+                         &one, out, CUDA_R_16F, lora->out_features,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+    };
+
     // 1. Copy hidden -> residual, RMSNorm -> norm_buf
     launch_copy_batch(B->residual, B->hidden, HIDDEN_SIZE * G, stream);
     launch_rms_norm_batch(B->norm_buf, B->residual, L.input_layernorm,
                           HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
 
-    // 2. QKV projections (GEMM)
-    auto project = [&](half* out, half* fp16w, NF4Weight& nf4w, const half* input, int out_dim, int in_dim) {
-        if (fp16w) batch_gemm(out, fp16w, input, out_dim, G, in_dim, stream);
-        else batch_gemm_q4l(out, nf4w, input, G, stream);
-    };
-    project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_DIM, HIDDEN_SIZE);
-    project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
-    project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE);
+    // 2. QKV projections
+    project(B->q_buf, L.q_proj_fp16, L.q_proj_nf4, B->norm_buf, Q_DIM, HIDDEN_SIZE, L.lora_q);
+    project(B->k_buf, L.k_proj_fp16, L.k_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE, L.lora_k);
+    project(B->v_buf, L.v_proj_fp16, L.v_proj_nf4, B->norm_buf, KV_DIM, HIDDEN_SIZE, L.lora_v);
 
     // 3. QKNorm + RoPE
     launch_qk_norm_batch(B->q_buf, B->k_buf, L.q_norm, L.k_norm,
@@ -732,8 +786,8 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
                                 B->attn_scores, B->d_positions, B->max_seq_len, G,
                                 NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, Q_DIM, KV_DIM, stream);
 
-    // 6. Output projection (input: attn_out, not norm_buf)
-    project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM);
+    // 6. Output projection
+    project(B->hidden, L.o_proj_fp16, L.o_proj_nf4, B->attn_out, HIDDEN_SIZE, Q_DIM, L.lora_o);
 
     // 7. Residual add
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
@@ -743,11 +797,11 @@ void InferenceEngine::forward_layer_batch(int layer_idx, int G, cudaStream_t str
     launch_rms_norm_batch(B->norm_buf, B->residual, L.post_attn_layernorm,
                           HIDDEN_SIZE, G, RMS_NORM_EPS, stream);
 
-    // 9. FFN: gate, up (input: norm_buf), SiLU, down (input: gate_buf after SiLU)
-    project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
-    project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    // 9. FFN
+    project(B->gate_buf, L.gate_proj_fp16, L.gate_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, L.lora_gate);
+    project(B->up_buf, L.up_proj_fp16, L.up_proj_nf4, B->norm_buf, INTERMEDIATE_SIZE, HIDDEN_SIZE, L.lora_up);
     launch_silu_mul_batch(B->gate_buf, B->up_buf, INTERMEDIATE_SIZE * G, stream);
-    project(B->hidden, L.down_proj_fp16, L.down_proj_nf4, B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE);
+    project(B->hidden, L.down_proj_fp16, L.down_proj_nf4, B->gate_buf, HIDDEN_SIZE, INTERMEDIATE_SIZE, L.lora_down);
 
     // 10. Residual add
     launch_residual_add_batch(B->hidden, B->residual, HIDDEN_SIZE * G, stream);
@@ -783,7 +837,8 @@ void InferenceEngine::decode_batch(int G) {
 
 std::vector<std::vector<int>> InferenceEngine::generate_batch(
     const std::vector<std::vector<int>>& prompts,
-    int max_new_tokens, float temperature, float top_p, int eos_token_id
+    int max_new_tokens, float temperature, float top_p, int eos_token_id,
+    const std::vector<int>& stop_token_ids
 ) {
     int G = prompts.size();
     int max_prompt_len = 0;
@@ -831,13 +886,24 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         }
         cudaMemcpy(B->h_tokens, B->d_tokens, G * sizeof(int), cudaMemcpyDeviceToHost);
 
-        // Check stopping
+        // Check stopping (eos + stop sequences)
         bool all_done = true;
+        int stop_len = stop_token_ids.size();
         for (int g = 0; g < G; g++) {
             if (!B->h_finished[g]) {
                 outputs[g].push_back(B->h_tokens[g]);
-                if (B->h_tokens[g] == eos_token_id) B->h_finished[g] = true;
-                else all_done = false;
+                if (B->h_tokens[g] == eos_token_id) {
+                    B->h_finished[g] = true;
+                } else if (stop_len > 0 && (int)outputs[g].size() >= stop_len) {
+                    bool match = true;
+                    for (int j = 0; j < stop_len; j++) {
+                        if (outputs[g][outputs[g].size() - stop_len + j] != stop_token_ids[j]) {
+                            match = false; break;
+                        }
+                    }
+                    if (match) B->h_finished[g] = true;
+                }
+                if (!B->h_finished[g]) all_done = false;
             }
         }
         if (all_done) break;

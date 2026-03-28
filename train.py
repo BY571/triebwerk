@@ -206,16 +206,17 @@ def grpo_step(model, optimizer, scaler, samples, config):
         scaler.scale(sample_loss / n_valid).backward()
         total_loss_val += loss_val
 
-        # Free intermediates + flush CUDA allocator
-        # empty_cache() IS needed on Jetson unified memory to prevent fragmentation
-        # that causes OOM after ~8 steps. On discrete GPUs this can be removed.
+        # Free intermediates
         del outputs, logits, new_lp, input_tensor, sample_loss
         del ratio, per_token_loss, new_comp_lp
         if config.loss_type == "grpo":
             del surr1, surr2
         else:
             del clipped_ratio
-        torch.cuda.empty_cache()
+        # empty_cache() IS needed on Jetson unified memory to prevent fragmentation.
+        # On discrete GPUs it destroys allocator cache and causes thrashing.
+        if getattr(config, 'empty_cache', False):
+            torch.cuda.empty_cache()
 
     # Gradient clipping + optimizer step
     scaler.unscale_(optimizer)
@@ -226,6 +227,7 @@ def grpo_step(model, optimizer, scaler, samples, config):
     if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
         print(f"  WARNING: NaN/Inf gradient norm, skipping step")
         optimizer.zero_grad()
+        scaler.update()
         return float('nan')
     scaler.step(optimizer)
     scaler.update()
@@ -237,7 +239,7 @@ def grpo_step(model, optimizer, scaler, samples, config):
 
 def generate_with_engine(engine, tokenizer, prompt, num_generations,
                          max_tokens, temperature, top_p, stop_ids):
-    """Generate G completions using C++ engine. Sequential (dp4a, memory-safe)."""
+    """Generate G completions using C++ engine (batched GEMM with tensor cores)."""
     if isinstance(prompt, list):
         text = tokenizer.apply_chat_template(
             prompt, tokenize=False, add_generation_prompt=True
@@ -247,18 +249,19 @@ def generate_with_engine(engine, tokenizer, prompt, num_generations,
 
     prompt_ids = tokenizer(text).input_ids
     eos_id = tokenizer.eos_token_id
-    completions = []
 
-    for _ in range(num_generations):
-        engine.reset()
-        comp_ids = engine.generate(
-            prompt_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            eos_token_id=eos_id,
-            stop_token_ids=stop_ids,
-        )
+    # Batched generation: all G completions in parallel
+    batch_results = engine.generate_batch(
+        [prompt_ids] * num_generations,
+        max_new_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_id,
+        stop_token_ids=stop_ids,
+    )
+
+    completions = []
+    for comp_ids in batch_results:
         truncated = (
             len(comp_ids) >= max_tokens
             and (len(comp_ids) == 0 or comp_ids[-1] != eos_id)
@@ -380,6 +383,12 @@ def train(args):
             engine.share_embedding(embed_weight.data_ptr())
         else:
             print(f"  Warning: cannot share embedding (dtype={embed_weight.dtype}, cuda={embed_weight.is_cuda})")
+
+        # Pre-dequant weights for fast batched GEMM (trades ~830MB VRAM for no per-step dequant)
+        # Only enable on GPUs with enough VRAM headroom (>= 12GB)
+        free_mem = torch.cuda.mem_get_info()[0]
+        if free_mem > 2e9:  # 2GB+ free after model loading
+            engine.cache_weights()
 
         from lora_sync import LoRASyncer
         syncer = LoRASyncer(model, engine,
@@ -614,6 +623,9 @@ def grpo_train(
     Returns:
         Path to final LoRA adapter directory.
     """
+    # Auto-detect: empty_cache needed on Jetson unified memory, harmful on discrete GPUs
+    is_integrated_gpu = torch.cuda.get_device_properties(0).is_integrated if torch.cuda.is_available() else False
+
     args = argparse.Namespace(
         model=model,
         max_steps=max_steps,
@@ -634,6 +646,7 @@ def grpo_train(
         mask_truncated=kwargs.get("mask_truncated", True),
         logging_steps=kwargs.get("logging_steps", 1),
         save_steps=kwargs.get("save_steps", 100),
+        empty_cache=kwargs.get("empty_cache", is_integrated_gpu),
     )
 
     # Inject dataset and reward_funcs so train() can use them
@@ -678,6 +691,10 @@ def main():
 
     if args.epsilon_high is None:
         args.epsilon_high = args.epsilon
+
+    # Auto-detect: empty_cache on Jetson (integrated GPU), skip on discrete
+    if not hasattr(args, 'empty_cache'):
+        args.empty_cache = torch.cuda.get_device_properties(0).is_integrated if torch.cuda.is_available() else False
 
     train(args)
 

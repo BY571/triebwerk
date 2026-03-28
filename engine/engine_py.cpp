@@ -39,6 +39,9 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("data_ptr"),
              "Share embedding from PyTorch tensor (pass tensor.data_ptr())")
 
+        .def("cache_weights", &InferenceEngine::cache_weights,
+             "Pre-dequant Q4L weights to fp16 for fast batched GEMM")
+
         .def("generate", &InferenceEngine::generate,
              py::arg("prompt"),
              py::arg("max_new_tokens") = 512,
@@ -86,6 +89,7 @@ PYBIND11_MODULE(jetson_engine, m) {
              py::arg("temperature") = 1.0f,
              py::arg("top_p") = 0.9f,
              py::arg("eos_token_id") = -1,
+             py::arg("stop_token_ids") = std::vector<int>{},
              "Generate from G prompts in parallel (GEMM, tensor cores).")
 
         .def("model_config", [](InferenceEngine& self) {
