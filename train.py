@@ -238,7 +238,7 @@ def grpo_step(model, optimizer, scaler, samples, config):
 
 def generate_with_engine(engine, tokenizer, prompt, num_generations,
                          max_tokens, temperature, top_p, stop_ids):
-    """Generate G completions in parallel using C++ engine batch generation."""
+    """Generate G completions using C++ engine. Sequential (dp4a, memory-safe)."""
     if isinstance(prompt, list):
         text = tokenizer.apply_chat_template(
             prompt, tokenize=False, add_generation_prompt=True
@@ -248,26 +248,25 @@ def generate_with_engine(engine, tokenizer, prompt, num_generations,
 
     prompt_ids = tokenizer(text).input_ids
     eos_id = tokenizer.eos_token_id
-
-    # Batch: generate all G completions in parallel (GEMM, tensor cores)
-    all_prompts = [prompt_ids] * num_generations
-    batch_results = engine.generate_batch(
-        all_prompts,
-        max_new_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=eos_id,
-    )
-
     completions = []
-    for comp_ids in batch_results:
+
+    for _ in range(num_generations):
+        engine.reset()
+        comp_ids = engine.generate(
+            prompt_ids,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_id,
+            stop_token_ids=stop_ids,
+        )
         truncated = (
             len(comp_ids) >= max_tokens
             and (len(comp_ids) == 0 or comp_ids[-1] != eos_id)
         )
         completions.append({
             "prompt_ids": prompt_ids,
-            "completion_ids": list(comp_ids),
+            "completion_ids": comp_ids,
             "truncated": truncated,
         })
 
@@ -382,15 +381,6 @@ def train(args):
             engine.share_embedding(embed_weight.data_ptr())
         else:
             print(f"  Warning: cannot share embedding (dtype={embed_weight.dtype}, cuda={embed_weight.is_cuda})")
-
-        # Pre-allocate batch KV cache once (avoids per-step reallocation + OOM)
-        max_prompt_len = 200  # typical GSM8K prompt ~100-200 tokens
-        batch_seq_len = max_prompt_len + args.max_completion_tokens
-        engine.generate_batch(
-            [[0]] * args.num_generations,  # dummy prompts to trigger allocation
-            max_new_tokens=1, temperature=0.001, eos_token_id=0,
-        )
-        print(f"  Batch KV cache pre-allocated: G={args.num_generations}, seq={batch_seq_len}")
 
         from lora_sync import LoRASyncer
         syncer = LoRASyncer(model, engine,
