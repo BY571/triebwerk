@@ -392,14 +392,19 @@ def train(args):
         syncer = LoRASyncer(model, engine,
                             lora_alpha=args.lora_rank, lora_rank=args.lora_rank)
 
-        # Pre-allocate batch buffers at max size to avoid mid-training realloc
-        warmup_ids = [0] * 10  # dummy prompt
+        # Pre-allocate batch arena at max size (prompt + max completion tokens)
+        # Use a dummy prompt long enough to trigger max KV cache allocation
+        dummy_prompt = list(range(100))  # ~100 token prompt
         engine.generate_batch(
-            [warmup_ids] * args.num_generations,
+            [dummy_prompt] * args.num_generations,
             max_new_tokens=args.max_completion_tokens,
-            temperature=0.001, top_p=1.0, eos_token_id=0,
+            temperature=0.001, top_p=1.0, eos_token_id=dummy_prompt[0],
         )
-        print(f"  Engine warmup complete (batch pre-allocated)")
+        print(f"  Engine warmup complete (arena pre-allocated)")
+
+    # Limit PyTorch's CUDA allocator to prevent it from grabbing engine's memory
+    if not args.dry_run and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.5)
 
     # ── Optimizer + scaler ──
     trainable_params = [p for p in model.parameters() if p.requires_grad]

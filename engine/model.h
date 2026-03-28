@@ -178,6 +178,25 @@ struct InferenceState {
     half* lora_scratch; // (max_lora_rank,)
 };
 
+// Simple GPU arena: one cudaMalloc, bump-pointer suballocation.
+// Prevents fragmentation with PyTorch's caching allocator.
+struct GpuArena {
+    char* base = nullptr;
+    size_t capacity = 0;
+    size_t offset = 0;
+
+    // Allocate from arena (256-byte aligned for cuBLAS)
+    void* alloc(size_t bytes) {
+        offset = (offset + 255) & ~(size_t)255;
+        void* ptr = base + offset;
+        offset += bytes;
+        return ptr;
+    }
+
+    void reset() { offset = 0; }
+    size_t used() const { return offset; }
+};
+
 // Batched generation state (G sequences in parallel)
 struct BatchState {
     int G;              // batch size (number of sequences)
@@ -288,6 +307,7 @@ public:
 
 private:
     bool weights_cached_ = false;
+    GpuArena batch_arena_;  // single allocation for all batch GPU buffers
     ModelConfig config_;
     ModelWeights weights_;
     InferenceState state_;

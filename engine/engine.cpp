@@ -37,11 +37,17 @@
 // cuBLAS handle (created once, reused)
 static cublasHandle_t cublas_handle = nullptr;
 
+static void* cublas_workspace = nullptr;
+static const size_t CUBLAS_WORKSPACE_SIZE = 4 * 1024 * 1024; // 4MB
+
 static void ensure_cublas() {
     if (!cublas_handle) {
         cublasCreate(&cublas_handle);
         cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH);
-        cublasSetStream(cublas_handle, 0);  // force default stream
+        cublasSetStream(cublas_handle, 0);
+        // Pre-allocate workspace to prevent cuBLAS from fighting PyTorch's allocator
+        cudaMalloc(&cublas_workspace, CUBLAS_WORKSPACE_SIZE);
+        cublasSetWorkspace(cublas_handle, cublas_workspace, CUBLAS_WORKSPACE_SIZE);
     }
 }
 
@@ -282,25 +288,13 @@ InferenceEngine::~InferenceEngine() {
     cudaFree(state_.q8_sums);
     cudaFree(state_.lora_scratch);
 
-    // Free batch state if allocated
+    // Free batch state (GPU memory is in arena, not individual mallocs)
     if (batch_) {
-        cudaFree(batch_->hidden); cudaFree(batch_->residual);
-        cudaFree(batch_->norm_buf); cudaFree(batch_->q_buf);
-        cudaFree(batch_->k_buf); cudaFree(batch_->v_buf);
-        cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
-        cudaFree(batch_->up_buf); cudaFree(batch_->logits);
-        cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
-        cudaFree(batch_->lora_scratch);
-        for (int i = 0; i < NUM_LAYERS; i++) {
-            cudaFree(batch_->kv_keys[i]);
-            cudaFree(batch_->kv_values[i]);
-        }
-        cudaFree(batch_->d_positions); cudaFree(batch_->d_tokens);
-        cudaFree(batch_->d_randoms);
         delete[] batch_->h_positions; delete[] batch_->h_tokens;
         delete[] batch_->h_finished; delete[] batch_->h_randoms;
         delete batch_;
     }
+    if (batch_arena_.base) cudaFree(batch_arena_.base);
 }
 
 // ============================================================================
@@ -353,25 +347,18 @@ void InferenceEngine::reset() {
 // ============================================================================
 
 void InferenceEngine::sleep() {
-    // Free batch state (biggest savings: KV cache + dequant scratch)
+    // Free batch state (GPU memory is one arena block)
     if (batch_) {
-        cudaFree(batch_->hidden); cudaFree(batch_->residual);
-        cudaFree(batch_->norm_buf); cudaFree(batch_->q_buf);
-        cudaFree(batch_->k_buf); cudaFree(batch_->v_buf);
-        cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
-        cudaFree(batch_->up_buf); cudaFree(batch_->logits);
-        cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
-        cudaFree(batch_->lora_scratch);
-        for (int i = 0; i < NUM_LAYERS; i++) {
-            cudaFree(batch_->kv_keys[i]);
-            cudaFree(batch_->kv_values[i]);
-        }
-        cudaFree(batch_->d_positions); cudaFree(batch_->d_tokens);
-        cudaFree(batch_->d_randoms);
         delete[] batch_->h_positions; delete[] batch_->h_tokens;
         delete[] batch_->h_finished; delete[] batch_->h_randoms;
         delete batch_;
         batch_ = nullptr;
+    }
+    if (batch_arena_.base) {
+        cudaFree(batch_arena_.base);
+        batch_arena_.base = nullptr;
+        batch_arena_.capacity = 0;
+        batch_arena_.offset = 0;
     }
 
     // Free single-sequence KV caches
@@ -716,64 +703,85 @@ std::vector<int> InferenceEngine::generate(
 
 void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     if (batch_ && batch_->G >= G && batch_->max_seq_len >= max_seq_len) return;
+
+    // Free old batch (host only -- GPU memory is in the arena)
     if (batch_) {
-        // Free old batch state before reallocating
-        cudaFree(batch_->hidden); cudaFree(batch_->residual);
-        cudaFree(batch_->norm_buf); cudaFree(batch_->q_buf);
-        cudaFree(batch_->k_buf); cudaFree(batch_->v_buf);
-        cudaFree(batch_->attn_out); cudaFree(batch_->gate_buf);
-        cudaFree(batch_->up_buf); cudaFree(batch_->logits);
-        cudaFree(batch_->attn_scores); cudaFree(batch_->dequant_scratch);
-        cudaFree(batch_->lora_scratch);
-        for (int i = 0; i < NUM_LAYERS; i++) {
-            cudaFree(batch_->kv_keys[i]);
-            cudaFree(batch_->kv_values[i]);
-        }
-        cudaFree(batch_->d_positions); cudaFree(batch_->d_tokens);
-        cudaFree(batch_->d_randoms);
         delete[] batch_->h_positions; delete[] batch_->h_tokens;
         delete[] batch_->h_finished; delete[] batch_->h_randoms;
         delete batch_;
     }
+
+    // Calculate total GPU memory needed
+    size_t need = 0;
+    auto add = [&](size_t bytes) { need = (need + 255) & ~(size_t)255; need += bytes; };
+    add(HIDDEN_SIZE * G * sizeof(half));          // hidden
+    add(HIDDEN_SIZE * G * sizeof(half));          // residual
+    add(HIDDEN_SIZE * G * sizeof(half));          // norm_buf
+    add(Q_DIM * G * sizeof(half));                // q_buf
+    add(KV_DIM * G * sizeof(half));               // k_buf
+    add(KV_DIM * G * sizeof(half));               // v_buf
+    add(Q_DIM * G * sizeof(half));                // attn_out
+    add(INTERMEDIATE_SIZE * G * sizeof(half));     // gate_buf
+    add(INTERMEDIATE_SIZE * G * sizeof(half));     // up_buf
+    add(VOCAB_SIZE * G * sizeof(float));           // logits
+    add(G * NUM_HEADS * max_seq_len * sizeof(float)); // attn_scores
+    if (!weights_cached_)
+        add((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)); // dequant_scratch
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_keys
+        add((size_t)G * max_seq_len * KV_DIM * sizeof(half));  // kv_values
+    }
+    add(G * sizeof(int));   // d_positions
+    add(G * sizeof(int));   // d_tokens
+    add(G * sizeof(float)); // d_randoms
+    add(64 * G * sizeof(half)); // lora_scratch
+
+    // (Re)allocate arena if needed
+    if (need > batch_arena_.capacity) {
+        if (batch_arena_.base) cudaFree(batch_arena_.base);
+        CUDA_CHECK(cudaMalloc(&batch_arena_.base, need));
+        batch_arena_.capacity = need;
+    }
+    batch_arena_.reset();
+
+    // Suballocate all buffers from the arena (zero per-step cudaMalloc calls)
     batch_ = new BatchState();
     batch_->G = G;
     batch_->max_seq_len = max_seq_len;
 
-    CUDA_CHECK(cudaMalloc(&batch_->hidden, HIDDEN_SIZE * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->residual, HIDDEN_SIZE * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->norm_buf, HIDDEN_SIZE * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->q_buf, Q_DIM * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->k_buf, KV_DIM * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->v_buf, KV_DIM * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->attn_out, Q_DIM * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->gate_buf, INTERMEDIATE_SIZE * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->up_buf, INTERMEDIATE_SIZE * G * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&batch_->logits, VOCAB_SIZE * G * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&batch_->attn_scores, G * NUM_HEADS * max_seq_len * sizeof(float)));
-    // Dequant scratch fp16 (only needed if weights are NOT cached)
+    batch_->hidden    = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
+    batch_->residual  = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
+    batch_->norm_buf  = (half*)batch_arena_.alloc(HIDDEN_SIZE * G * sizeof(half));
+    batch_->q_buf     = (half*)batch_arena_.alloc(Q_DIM * G * sizeof(half));
+    batch_->k_buf     = (half*)batch_arena_.alloc(KV_DIM * G * sizeof(half));
+    batch_->v_buf     = (half*)batch_arena_.alloc(KV_DIM * G * sizeof(half));
+    batch_->attn_out  = (half*)batch_arena_.alloc(Q_DIM * G * sizeof(half));
+    batch_->gate_buf  = (half*)batch_arena_.alloc(INTERMEDIATE_SIZE * G * sizeof(half));
+    batch_->up_buf    = (half*)batch_arena_.alloc(INTERMEDIATE_SIZE * G * sizeof(half));
+    batch_->logits    = (float*)batch_arena_.alloc(VOCAB_SIZE * G * sizeof(float));
+    batch_->attn_scores = (float*)batch_arena_.alloc(G * NUM_HEADS * max_seq_len * sizeof(float));
     if (!weights_cached_) {
-        CUDA_CHECK(cudaMalloc(&batch_->dequant_scratch, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half)));
+        batch_->dequant_scratch = (half*)batch_arena_.alloc((size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(half));
     } else {
         batch_->dequant_scratch = nullptr;
     }
-    // KV caches
     for (int i = 0; i < NUM_LAYERS; i++) {
-        CUDA_CHECK(cudaMalloc(&batch_->kv_keys[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&batch_->kv_values[i], (size_t)G * max_seq_len * KV_DIM * sizeof(half)));
+        batch_->kv_keys[i]   = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
+        batch_->kv_values[i] = (half*)batch_arena_.alloc((size_t)G * max_seq_len * KV_DIM * sizeof(half));
     }
-    // Per-sequence state
+    batch_->d_positions  = (int*)batch_arena_.alloc(G * sizeof(int));
+    batch_->d_tokens     = (int*)batch_arena_.alloc(G * sizeof(int));
+    batch_->d_randoms    = (float*)batch_arena_.alloc(G * sizeof(float));
+    batch_->lora_scratch = (half*)batch_arena_.alloc(64 * G * sizeof(half));
+
+    // Host allocations
     batch_->h_positions = new int[G]();
-    CUDA_CHECK(cudaMalloc(&batch_->d_positions, G * sizeof(int)));
     batch_->h_tokens = new int[G]();
-    CUDA_CHECK(cudaMalloc(&batch_->d_tokens, G * sizeof(int)));
     batch_->h_finished = new bool[G]();
     batch_->h_randoms = new float[G]();
-    CUDA_CHECK(cudaMalloc(&batch_->d_randoms, G * sizeof(float)));
-    // LoRA scratch: max_rank(64) * G
-    CUDA_CHECK(cudaMalloc(&batch_->lora_scratch, 64 * G * sizeof(half)));
 
-    std::cout << "  Batch allocated: G=" << G << " max_seq=" << max_seq_len
-              << " KV=" << (G * max_seq_len * KV_DIM * 2 * NUM_LAYERS * 2 / 1e6) << "MB" << std::endl;
+    std::cout << "  Batch arena: " << batch_arena_.used() / 1e6 << "MB (1 cudaMalloc, G="
+              << G << " seq=" << max_seq_len << ")" << std::endl;
 }
 
 void InferenceEngine::batch_gemm(half* out, const half* weight, const half* in,
