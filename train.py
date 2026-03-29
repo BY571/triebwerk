@@ -362,6 +362,49 @@ def generate_with_hf(model, tokenizer, prompt, num_generations,
     return completions
 
 
+VERSION = "0.1.0"
+
+def print_banner(args, run_id):
+    gpu_name = "CPU"
+    gpu_mem = ""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        gpu_mem = f" ({mem_gb:.1f} GB)"
+
+    is_integrated = torch.cuda.get_device_properties(0).is_integrated if torch.cuda.is_available() else False
+    if args.dry_run:
+        gang = "Leerlauf (dry-run)"
+    elif is_integrated:
+        gang = "Sparsam"
+    else:
+        gang = "Schnell"
+
+    engine_mode = "C++ dp4a" if not args.dry_run else "HF generate"
+
+    print("""
+   \033[1;36m████████╗██████╗ ██╗███████╗██████╗ ██╗    ██╗███████╗██████╗ ██╗  ██╗\033[0m
+   \033[1;36m╚══██╔══╝██╔══██╗██║██╔════╝██╔══██╗██║    ██║██╔════╝██╔══██╗██║ ██╔╝\033[0m
+   \033[1;36m   ██║   ██████╔╝██║█████╗  ██████╔╝██║ █╗ ██║█████╗  ██████╔╝█████╔╝ \033[0m
+   \033[1;36m   ██║   ██╔══██╗██║██╔══╝  ██╔══██╗██║███╗██║██╔══╝  ██╔══██╗██╔═██╗ \033[0m
+   \033[1;36m   ██║   ██║  ██║██║███████╗██████╔╝╚███╔███╔╝███████╗██║  ██║██║  ██╗\033[0m
+   \033[1;36m   ╚═╝   ╚═╝  ╚═╝╚═╝╚══════╝╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝\033[0m
+""")
+    w = 62
+    print(f"   \033[90m{'=' * w}\033[0m")
+    print(f"   \033[1m{'TRIEBWERK':^{w}}\033[0m")
+    print(f"   \033[90m{'Hochleistung GRPO Training':^{w}}\033[0m")
+    print(f"   \033[90m{'-' * w}\033[0m")
+    print(f"   \033[1m Version:\033[0m  {VERSION}")
+    print(f"   \033[1m Maschine:\033[0m {gpu_name}{gpu_mem}")
+    print(f"   \033[1m Antrieb:\033[0m  {engine_mode}")
+    print(f"   \033[1m Gang:\033[0m     {gang}")
+    print(f"   \033[1m Modell:\033[0m   {args.model}")
+    print(f"   \033[1m Schritte:\033[0m {args.max_steps} (G={args.num_generations}, {args.max_completion_tokens} tok)")
+    print(f"   \033[1m Lauf:\033[0m     {run_id}")
+    print(f"   \033[90m{'=' * w}\033[0m")
+
+
 # ── Training Loop ──
 
 def train(args):
@@ -369,12 +412,7 @@ def train(args):
     run_dir = f"{args.output_dir}/{run_id}"
     os.makedirs(run_dir, exist_ok=True)
 
-    print("=" * 60)
-    print("GRPO Training — Standalone (no TRL)")
-    print(f"  Loss: {args.loss_type}, epsilon={args.epsilon}")
-    print(f"  Model: {args.model}")
-    print(f"  Engine: {'C++ engine' if not args.dry_run else 'HF generate (dry-run)'}")
-    print(f"  Run: {run_id}")
+    print_banner(args, run_id)
     print("=" * 60)
 
     # ── C++ Engine first (if not dry-run) ──
