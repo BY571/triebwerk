@@ -1099,13 +1099,8 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
                                 VOCAB_SIZE, G, temperature, top_p, gen_stream);
         }
 
-        // Wait for engine_stream_ to finish, then read tokens
-        // Use event sync (lighter than stream sync) to synchronize with default stream
-        cudaEvent_t ev;
-        cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-        cudaEventRecord(ev, gen_stream);
-        cudaStreamWaitEvent(0, ev);  // default stream waits for engine_stream_
-        cudaEventDestroy(ev);
+        // Sync engine_stream_ then read tokens
+        cudaStreamSynchronize(gen_stream);
         cudaMemcpy(B->h_tokens, B->d_tokens, G * sizeof(int), cudaMemcpyDeviceToHost);
 
         // Check stopping (eos + stop sequences)
