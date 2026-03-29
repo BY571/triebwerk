@@ -303,6 +303,9 @@ public:
     // Pre-dequant Q4L weights to fp16 for fast batched GEMM
     void cache_weights();
 
+    // Set external arena memory (allocated by PyTorch, avoids allocator contention)
+    void set_arena(void* ptr, size_t size);
+
     // Sleep/wake: free GPU buffers during training, re-allocate for generation
     void sleep();
     void wake();

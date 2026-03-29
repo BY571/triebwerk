@@ -42,6 +42,12 @@ PYBIND11_MODULE(jetson_engine, m) {
         .def("cache_weights", &InferenceEngine::cache_weights,
              "Pre-dequant Q4L weights to fp16 for fast batched GEMM")
 
+        .def("set_arena", [](InferenceEngine& self, size_t ptr, size_t size) {
+                 self.set_arena(reinterpret_cast<void*>(ptr), size);
+             },
+             py::arg("data_ptr"), py::arg("size"),
+             "Set external arena memory (pass torch tensor.data_ptr() and nbytes)")
+
         .def("sleep", &InferenceEngine::sleep,
              "Free GPU buffers (call before PyTorch training phase)")
 

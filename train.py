@@ -330,7 +330,30 @@ def train(args):
     print(f"  Run: {run_id}")
     print("=" * 60)
 
-    # ── Load model ──
+    # ── C++ Engine first (if not dry-run) ──
+    # Load engine BEFORE PyTorch so it gets clean VRAM with no fragmentation.
+    # PyTorch's caching allocator then works with the remaining contiguous block.
+    engine = None
+    syncer = None
+    if not args.dry_run:
+        sys.path.insert(0, os.environ.get("ENGINE_BUILD", "engine/build2"))
+        import jetson_engine
+        engine = jetson_engine.Engine(1024)
+        weights_path = os.environ.get("ENGINE_WEIGHTS", "engine/weights_q4l")
+        print(f"\nLoading C++ engine weights from {weights_path}...")
+        engine.load_weights(weights_path)
+        engine.cache_weights()
+
+        # Pre-allocate batch arena at max size
+        dummy_prompt = list(range(200))
+        engine.generate_batch(
+            [dummy_prompt] * args.num_generations,
+            max_new_tokens=args.max_completion_tokens,
+            temperature=0.001, top_p=1.0, eos_token_id=dummy_prompt[0],
+        )
+        print(f"  Engine loaded + arena pre-allocated")
+
+    # ── Load PyTorch model (gets remaining contiguous VRAM) ──
     print(f"\nLoading {args.model} (4-bit NF4, fp16)...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -366,45 +389,20 @@ def train(args):
     total = sum(p.numel() for p in model.parameters())
     print(f"  LoRA rank={args.lora_rank}, trainable: {trainable:,} / {total:,}")
 
-    # ── C++ Engine (if not dry-run) ──
-    engine = None
-    syncer = None
-    if not args.dry_run:
-        sys.path.insert(0, os.environ.get("ENGINE_BUILD", "engine/build2"))
-        import jetson_engine
-        engine = jetson_engine.Engine(1024)
-        weights_path = os.environ.get("ENGINE_WEIGHTS", "engine/weights_q4l")
-        print(f"\nLoading C++ engine weights from {weights_path}...")
-        engine.load_weights(weights_path)
+    # Limit PyTorch's CUDA allocator to prevent it from grabbing engine's memory
+    if not args.dry_run and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.5)
 
-        # Share PyTorch's embedding with C++ engine (saves 311MB on Jetson)
+    # ── Connect engine to PyTorch model ──
+    if engine is not None:
+        # Share embedding (engine uses PyTorch's tensor, saves 311MB)
         embed_weight = model.base_model.model.model.embed_tokens.weight
         if embed_weight.dtype == torch.float16 and embed_weight.is_cuda:
             engine.share_embedding(embed_weight.data_ptr())
-        else:
-            print(f"  Warning: cannot share embedding (dtype={embed_weight.dtype}, cuda={embed_weight.is_cuda})")
-
-        # Pre-dequant weights for fast batched GEMM
-        # Eliminates per-step dequant scratch allocation that causes VRAM contention
-        engine.cache_weights()
 
         from lora_sync import LoRASyncer
         syncer = LoRASyncer(model, engine,
                             lora_alpha=args.lora_rank, lora_rank=args.lora_rank)
-
-        # Pre-allocate batch arena at max size (prompt + max completion tokens)
-        # Use a dummy prompt long enough to trigger max KV cache allocation
-        dummy_prompt = list(range(100))  # ~100 token prompt
-        engine.generate_batch(
-            [dummy_prompt] * args.num_generations,
-            max_new_tokens=args.max_completion_tokens,
-            temperature=0.001, top_p=1.0, eos_token_id=dummy_prompt[0],
-        )
-        print(f"  Engine warmup complete (arena pre-allocated)")
-
-    # Limit PyTorch's CUDA allocator to prevent it from grabbing engine's memory
-    if not args.dry_run and torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(0.5)
 
     # ── Optimizer + scaler ──
     trainable_params = [p for p in model.parameters() if p.requires_grad]

@@ -745,8 +745,9 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
     add(G * sizeof(float)); // d_randoms
     add(64 * G * sizeof(half)); // lora_scratch
 
-    // (Re)allocate arena if needed (invalidates CUDA graph)
+    // (Re)allocate arena if needed
     if (need > batch_arena_.capacity) {
+        // Only cudaMalloc if no external arena was set
         if (batch_arena_.base) cudaFree(batch_arena_.base);
         CUDA_CHECK(cudaMalloc(&batch_arena_.base, need));
         batch_arena_.capacity = need;
@@ -833,6 +834,19 @@ void InferenceEngine::cache_weights() {
     cudaDeviceSynchronize();
     weights_cached_ = true;
     std::cout << "  Cached " << total_bytes / 1e6 << "MB dequanted weights" << std::endl;
+}
+
+void InferenceEngine::set_arena(void* ptr, size_t size) {
+    // Use externally-allocated memory (from PyTorch) as the batch arena.
+    // This eliminates cudaMalloc/PyTorch allocator contention.
+    if (batch_arena_.base && batch_arena_.capacity > 0) {
+        // Only free if we own it (not external)
+        // After set_arena, we never own the base pointer
+    }
+    batch_arena_.base = (char*)ptr;
+    batch_arena_.capacity = size;
+    batch_arena_.offset = 0;
+    std::cout << "  Arena set to external memory (" << size / 1e6 << "MB)" << std::endl;
 }
 
 void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,

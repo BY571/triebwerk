@@ -1,0 +1,5 @@
+# ninja log v7
+1	4499	1774712065404329907	/home/sebastian/Documents/jetson-llm-train/unsloth_compiled_cache/.cache/flashinfer/0.6.1/89/cached_ops/sampling/flashinfer_sampling_binding.cuda.o	727ba3b6c2331385
+0	13827	1774712065403329888	/home/sebastian/Documents/jetson-llm-train/unsloth_compiled_cache/.cache/flashinfer/0.6.1/89/cached_ops/sampling/renorm.cuda.o	2df5effdcfbce37f
+0	56623	1774712065403329888	/home/sebastian/Documents/jetson-llm-train/unsloth_compiled_cache/.cache/flashinfer/0.6.1/89/cached_ops/sampling/sampling.cuda.o	257cfa7df0ee590d
+56623	56706	1774712122026400107	/home/sebastian/Documents/jetson-llm-train/unsloth_compiled_cache/.cache/flashinfer/0.6.1/89/cached_ops/sampling/sampling.so	3abe059642d29ca6
