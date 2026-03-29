@@ -10,7 +10,7 @@ Fast LoRA fine-tuning engine for LLMs. Custom C++/CUDA inference engine with CUD
 | TRL + HF generate | Jetson Orin 8GB | 130.6s | ~7 |
 | vLLM | RTX 4060 | 5.2s | ~375 |
 | **Triebwerk** | **RTX 4060** | **5.8s** | **~300** |
-| **Triebwerk** | **Jetson Orin 8GB** | **~36s** | **~60** |
+| **Triebwerk** | **Jetson Orin 8GB** | **16.5s** | **~104** |
 
 Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretrained()`, deploy anywhere.
 
