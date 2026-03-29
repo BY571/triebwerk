@@ -235,6 +235,10 @@ struct BatchState {
     bool* h_finished;   // host (G,)
     float* h_randoms;   // host (G,)
     float* d_randoms;   // device (G,)
+
+    // Pre-generated random values for all tokens (max_new_tokens * G)
+    float* d_all_randoms;   // device (max_tokens * G)
+    int all_randoms_size;   // number of floats allocated
 };
 
 // Top-level engine
@@ -308,6 +312,14 @@ public:
 private:
     bool weights_cached_ = false;
     GpuArena batch_arena_;
+
+    // Dedicated stream for batched decode (isolated from PyTorch's default stream)
+    cudaStream_t engine_stream_ = nullptr;
+
+    // CUDA graph for batched decode + sampling
+    cudaGraph_t decode_graph_ = nullptr;
+    cudaGraphExec_t decode_graph_exec_ = nullptr;
+    int graph_G_ = 0;
     ModelConfig config_;
     ModelWeights weights_;
     InferenceState state_;
@@ -324,7 +336,7 @@ private:
     // Batch generation internals
     BatchState* batch_;  // allocated on first generate_batch call
     void alloc_batch(int G, int max_seq_len);
-    void decode_batch(int G);
+    void decode_batch(int G, cudaStream_t stream = 0);
     void forward_layer_batch(int layer_idx, int G, cudaStream_t stream);
 
     // Batched GEMM: (M,K) @ (K,N) -> (M,N) where N=G
