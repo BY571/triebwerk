@@ -334,6 +334,107 @@ __device__ __forceinline__ void q4l_dp4a_gemv_block(
     }
 }
 
+// ============================================================================
+// Fused W4A16 batch GEMM: read 4-bit weights ONCE, multiply against G inputs
+// Eliminates the fp16 dequant buffer (830MB) entirely.
+// Each block computes ROWS_PER_BLOCK rows of the output for ALL G columns.
+// Weight layout: Q4L (dp4a-friendly: lo nibbles = elem[0..3], hi = elem[4..7])
+// Input: fp16 (in_dim, G) column-major
+// Output: fp16 (out_dim, G) column-major
+// ============================================================================
+
+__global__ __launch_bounds__(256, 4)
+void q4l_batch_gemm_kernel(
+    const uint8_t* __restrict__ weight_data,
+    const float* __restrict__ w_scales,   // per-block scale factors
+    const half* __restrict__ input,       // (in_dim, G) column-major fp16
+    half* __restrict__ output,            // (out_dim, G) column-major fp16
+    int in_dim, int out_dim, int G
+) {
+    const int n_warps = blockDim.x / 32;
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int bytes_per_row = in_dim / 2;
+    const int blocks_per_row = in_dim >> 6;
+    const int vec_per_row = bytes_per_row >> 2;
+
+    // Shared memory: sums[RPB * G * n_warps]
+    extern __shared__ float s_sums[];
+
+    int first_row = blockIdx.x * ROWS_PER_BLOCK;
+
+    for (int r = 0; r < ROWS_PER_BLOCK; r++) {
+        int row = first_row + r;
+        if (row >= out_dim) break;
+
+        // Accumulate G output values per row
+        float sums[8] = {};  // max G=8, registers
+
+        const int row_byte_start = row * bytes_per_row;
+        const int w_scale_start = row * blocks_per_row;
+        const uint32_t* row_u32 = reinterpret_cast<const uint32_t*>(
+            weight_data + row_byte_start);
+
+        for (int vi = threadIdx.x; vi < vec_per_row; vi += (int)blockDim.x) {
+            uint32_t packed = __ldg(&row_u32[vi]);
+            int base_elem = vi << 3;
+            int w_blk = base_elem >> 6;
+            float w_sc = __ldg(&w_scales[w_scale_start + w_blk]);
+
+            // Dequant 8 weight elements to fp32
+            uint8_t b0 = packed & 0xFF;
+            uint8_t b1 = (packed >> 8) & 0xFF;
+            uint8_t b2 = (packed >> 16) & 0xFF;
+            uint8_t b3 = (packed >> 24) & 0xFF;
+            float w[8];
+            w[0] = ((float)(b0 & 0xF) - 8.0f) * w_sc;
+            w[1] = ((float)(b1 & 0xF) - 8.0f) * w_sc;
+            w[2] = ((float)(b2 & 0xF) - 8.0f) * w_sc;
+            w[3] = ((float)(b3 & 0xF) - 8.0f) * w_sc;
+            w[4] = ((float)(b0 >> 4) - 8.0f) * w_sc;
+            w[5] = ((float)(b1 >> 4) - 8.0f) * w_sc;
+            w[6] = ((float)(b2 >> 4) - 8.0f) * w_sc;
+            w[7] = ((float)(b3 >> 4) - 8.0f) * w_sc;
+
+            // Multiply against all G input columns (weight reuse!)
+            for (int g = 0; g < G; g++) {
+                const half* x_col = input + (size_t)g * in_dim;
+                float s = 0.0f;
+                s = __fmaf_rn(w[0], __half2float(__ldg(&x_col[base_elem])), s);
+                s = __fmaf_rn(w[1], __half2float(__ldg(&x_col[base_elem+1])), s);
+                s = __fmaf_rn(w[2], __half2float(__ldg(&x_col[base_elem+2])), s);
+                s = __fmaf_rn(w[3], __half2float(__ldg(&x_col[base_elem+3])), s);
+                s = __fmaf_rn(w[4], __half2float(__ldg(&x_col[base_elem+4])), s);
+                s = __fmaf_rn(w[5], __half2float(__ldg(&x_col[base_elem+5])), s);
+                s = __fmaf_rn(w[6], __half2float(__ldg(&x_col[base_elem+6])), s);
+                s = __fmaf_rn(w[7], __half2float(__ldg(&x_col[base_elem+7])), s);
+                sums[g] += s;
+            }
+        }
+
+        // Warp + cross-warp reduction for each G column
+        for (int g = 0; g < G; g++) {
+            float sum = sums[g];
+            #pragma unroll
+            for (int off = 16; off > 0; off /= 2)
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, off);
+            if (lane_id == 0) s_sums[g * n_warps + warp_id] = sum;
+        }
+        __syncthreads();
+
+        if (warp_id == 0) {
+            for (int g = 0; g < G; g++) {
+                float total = (lane_id < n_warps) ? s_sums[g * n_warps + lane_id] : 0.0f;
+                #pragma unroll
+                for (int off = 16; off > 0; off /= 2)
+                    total += __shfl_down_sync(0xFFFFFFFF, total, off);
+                if (lane_id == 0) output[row + (size_t)g * out_dim] = __float2half(total);
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // dp4a kernel wrapper with dynamic shared memory
 // Layout: s_sums[RPB * n_warps] + s_q8[in_dim] + s_q8_sc[in_dim/64]
 __global__ __launch_bounds__(256, 6)
@@ -509,6 +610,20 @@ void launch_q4l_dp4a_gemv(
                 + blocks_per_row * sizeof(float);
     q4l_dp4a_kernel<<<nb, threads, smem, stream>>>(
         w, w_scales, q8, q8_sc, q8_sm, y, in_dim, out_dim);
+}
+
+// Fused W4A16 batch GEMM: read Q4L weights once, multiply against G fp16 inputs
+void launch_q4l_batch_gemm(
+    const uint8_t* w, const float* w_scales,
+    const half* input, half* output,
+    int out_dim, int in_dim, int G, cudaStream_t stream
+) {
+    int nb = (out_dim + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    int threads = (in_dim / 2 / 4 <= 128) ? 128 : 256;
+    int n_warps = threads / 32;
+    size_t smem = G * n_warps * sizeof(float);
+    q4l_batch_gemm_kernel<<<nb, threads, smem, stream>>>(
+        w, w_scales, input, output, in_dim, out_dim, G);
 }
 
 // ============================================================================

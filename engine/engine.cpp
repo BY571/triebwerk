@@ -110,6 +110,7 @@ extern "C" {
     void launch_quantize_input_q8(const half* input, int8_t* q8_data, float* q8_scales, float* q8_sums, int dim, cudaStream_t stream);
     void launch_q4l_dp4a_gemv(const uint8_t* w, const float* w_scales, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
     void launch_dequant_q4l(half* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
+    void launch_q4l_batch_gemm(const uint8_t* w, const float* w_scales, const half* input, half* output, int out_dim, int in_dim, int G, cudaStream_t stream);
 
     // Batched kernel launchers
     void launch_embed_batch(half* h, const half* et, const int* tok, int G, int hidden_size, cudaStream_t s);
@@ -868,10 +869,10 @@ void InferenceEngine::set_arena(void* ptr, size_t size) {
 void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* in,
                                       int N, cudaStream_t stream) {
     if (w.fp16_cache) {
-        // Use pre-dequanted fp16 weights (no per-step dequant)
+        // Use pre-dequanted fp16 weights with cuBLAS tensor cores
         batch_gemm(out, w.fp16_cache, in, w.out_dim, N, w.in_dim, stream);
     } else {
-        // Fallback: dequant to scratch each step
+        // Fallback: dequant to scratch then cuBLAS
         launch_dequant_q4l(batch_->dequant_scratch, w.data, w.absmax,
                            w.out_dim, w.in_dim, stream);
         batch_gemm(out, (const half*)batch_->dequant_scratch, in,
