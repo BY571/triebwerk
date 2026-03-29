@@ -185,29 +185,29 @@ def compute_batch_token_logprobs(model, completions, device):
 
 
 def grpo_step(model, optimizer, scaler, samples, config):
-    """One GRPO gradient step.
+    """One GRPO gradient step (TRL-compatible loss normalization).
 
-    Args:
-        model: PEFT model (LoRA on 4-bit base)
-        optimizer: AdamW
-        scaler: GradScaler for fp16 AMP
-        samples: list of dicts with keys:
-            prompt_ids, completion_ids, old_logprobs, advantage, mask_weight
-        config: namespace with epsilon, epsilon_high, loss_type, max_grad_norm
-
-    Returns:
-        mean loss (float)
+    Uses flat token averaging across all completions, matching TRL's
+    GRPOTrainer.compute_loss: loss = sum(token_losses) / total_tokens.
+    Longer completions contribute more gradient (weighted by token count).
     """
     device = next(model.parameters()).device
     optimizer.zero_grad()
 
-    # Pre-filter valid samples for correct loss normalization
+    # Pre-filter valid samples
     valid_samples = [s for s in samples
                      if s["mask_weight"] != 0.0
                      and len(s["completion_ids"]) > 0
                      and s["advantage"] != 0.0]
-    n_valid = len(valid_samples)
-    if n_valid == 0:
+    if len(valid_samples) == 0:
+        return 0.0
+
+    # TRL-style flat token averaging with gradient accumulation.
+    # Each sample's gradient is weighted by (tokens_in_sample / total_tokens)
+    # so longer completions contribute proportionally more, matching TRL.
+    # We backward per-sample to avoid OOM from holding all graphs simultaneously.
+    total_tokens = sum(len(s["completion_ids"]) for s in valid_samples)
+    if total_tokens == 0:
         return 0.0
 
     total_loss_val = 0.0
@@ -240,30 +240,23 @@ def grpo_step(model, optimizer, scaler, samples, config):
                 clipped_ratio = torch.clamp(ratio, 1.0 - config.epsilon, 1.0 + config.epsilon_high)
                 per_token_loss = -clipped_ratio * adv
 
-            sample_loss = per_token_loss.mean()
+            # This sample's contribution: sum of token losses / total tokens across ALL samples
+            sample_loss = per_token_loss.sum() / total_tokens
 
-        # Skip NaN/Inf losses (can happen with fp16 overflow)
         loss_val = sample_loss.item()
-        if math.isnan(loss_val) or math.isinf(loss_val):
-            del outputs, logits, new_lp, input_tensor, sample_loss
-            del ratio, per_token_loss, new_comp_lp
-            continue
+        if not (math.isnan(loss_val) or math.isinf(loss_val)):
+            scaler.scale(sample_loss).backward()
+            total_loss_val += per_token_loss.sum().item()
 
-        # Normalize by n_valid (not n_samples) for consistent gradients
-        scaler.scale(sample_loss / n_valid).backward()
-        total_loss_val += loss_val
-
-        # Free intermediates
         del outputs, logits, new_lp, input_tensor, sample_loss
         del ratio, per_token_loss, new_comp_lp
         if config.loss_type == "grpo":
             del surr1, surr2
         else:
             del clipped_ratio
-        # empty_cache() IS needed on Jetson unified memory to prevent fragmentation.
-        # On discrete GPUs it destroys allocator cache and causes thrashing.
-        if getattr(config, 'empty_cache', False):
-            torch.cuda.empty_cache()
+
+    if getattr(config, 'empty_cache', False):
+        torch.cuda.empty_cache()
 
     # Gradient clipping + optimizer step
     scaler.unscale_(optimizer)
@@ -279,7 +272,7 @@ def grpo_step(model, optimizer, scaler, samples, config):
     scaler.step(optimizer)
     scaler.update()
 
-    return total_loss_val / n_valid
+    return total_loss_val / total_tokens
 
 
 # ── Generation ──
