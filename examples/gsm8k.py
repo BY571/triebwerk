@@ -15,7 +15,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets import load_dataset
-from train import grpo_train
+from triebwerk import GRPOTrainer
 
 SYSTEM_PROMPT = """Respond in the following format:
 <reasoning>
@@ -110,13 +110,16 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    grpo_train(
-        dataset=get_gsm8k(),
-        reward_funcs=[xmlcount_reward, format_reward, integer_reward, correctness_reward],
+    trainer = GRPOTrainer(
         model="Qwen/Qwen3-0.6B",
+        reward_funcs=[xmlcount_reward, format_reward, integer_reward, correctness_reward],
+        loss_type="dapo",
+        dry_run=args.dry_run,
+    )
+    trainer.train(
+        dataset=get_gsm8k(),
         max_steps=args.max_steps,
         num_generations=4,
         max_completion_tokens=512,
         stop_texts=["</answer>"],
-        dry_run=args.dry_run,
     )

@@ -20,7 +20,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets import Dataset
-from train import grpo_train
+from triebwerk import GRPOTrainer
 
 SYSTEM_PROMPT = """Count the exact number of times a specific letter appears in a word.
 Think step by step, going through each character of the word.
@@ -123,13 +123,16 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    grpo_train(
-        dataset=generate_dataset(),
-        reward_funcs=[format_reward, counting_reward],
+    trainer = GRPOTrainer(
         model="Qwen/Qwen3-0.6B",
+        reward_funcs=[format_reward, counting_reward],
+        loss_type="dapo",
+        dry_run=args.dry_run,
+    )
+    trainer.train(
+        dataset=generate_dataset(),
         max_steps=args.max_steps,
         num_generations=4,
         max_completion_tokens=512,
         stop_texts=["</answer>"],
-        dry_run=args.dry_run,
     )

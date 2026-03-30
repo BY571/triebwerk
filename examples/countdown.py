@@ -17,7 +17,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets import load_dataset
-from train import grpo_train
+from triebwerk import GRPOTrainer
 
 SYSTEM_PROMPT = """You are given a list of numbers and a target number.
 Your task is to find an arithmetic expression using the given numbers that equals the target.
@@ -119,13 +119,16 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    grpo_train(
-        dataset=get_countdown(),
-        reward_funcs=[format_reward, equation_reward],
+    trainer = GRPOTrainer(
         model="Qwen/Qwen3-0.6B",
+        reward_funcs=[format_reward, equation_reward],
+        loss_type="dapo",
+        dry_run=args.dry_run,
+    )
+    trainer.train(
+        dataset=get_countdown(),
         max_steps=args.max_steps,
         num_generations=4,
         max_completion_tokens=512,
         stop_texts=["</answer>"],
-        dry_run=args.dry_run,
     )

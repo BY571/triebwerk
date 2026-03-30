@@ -14,7 +14,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets import Dataset
-from train import grpo_train
+from triebwerk import GRPOTrainer
 
 
 # ── Step 1: Define your reward function ──
@@ -72,12 +72,15 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    grpo_train(
-        dataset=dataset,
-        reward_funcs=[quality_reward, conciseness_reward],
+    trainer = GRPOTrainer(
         model="Qwen/Qwen3-0.6B",
+        reward_funcs=[quality_reward, conciseness_reward],
+        loss_type="dapo",
+        dry_run=args.dry_run,
+    )
+    trainer.train(
+        dataset=dataset,
         max_steps=args.max_steps,
         num_generations=4,
-        max_completion_tokens=128,    # short answers expected
-        dry_run=args.dry_run,
+        max_completion_tokens=128,
     )
