@@ -42,8 +42,9 @@ trainer = GRPOTrainer(
     loss_type="dapo",  # or "grpo"
 )
 
-# Delightful Policy Gradient -- no reference model, simpler, one hyperparameter
-# Includes Kondo gate: auto-skips backward pass for low-value samples
+# Delightful Policy Gradient (https://arxiv.org/abs/2603.14608)
+# No reference model, simpler, one hyperparameter
+# Includes Kondo gate (https://arxiv.org/abs/2603.20526): auto-skips backward for low-value samples
 trainer = DGTrainer(
     model="Qwen/Qwen3-0.6B",
     reward_funcs=[my_reward],
@@ -148,34 +149,3 @@ All Qwen3 variants (runtime config, no recompilation):
 - **Validated**: RTX 4060 Laptop 8GB (sm_89), Jetson Orin Nano 8GB (sm_87)
 - **Target**: Any NVIDIA GPU with sm_61+ (Pascal and later)
 
-## Repo structure
-
-```
-triebwerk/                # Python package
-  trainers/
-    base.py               #   BaseTrainer (model loading, generation, training loop)
-    grpo.py               #   GRPOTrainer (GRPO/DAPO clipped surrogate)
-    dg.py                 #   DGTrainer (Delightful PG + Kondo gate)
-  engine.py               #   C++ engine wrapper
-  generation.py           #   generate_with_engine, generate_with_hf
-  rewards.py              #   Built-in reward helpers
-  utils.py                #   Advantages, batched log-probs
-  banner.py               #   ASCII startup banner + memory map
-  compat.py               #   Jetson AMP patches
-  lora_sync.py            #   LoRA weight sync (PyTorch <-> engine)
-train.py                  # CLI entry point
-engine/                   # C++/CUDA inference engine
-  engine.cpp              #   Forward pass, CUDA graphs, generation loop
-  kernels.cu              #   CUDA kernels (attention, RoPE, sampling, norms)
-  nf4_gemv_fast.cu        #   4-bit GEMV/GEMM kernels (dp4a, fused variants)
-  model.h                 #   Model config, weight structs, arena allocator
-  weights.cpp             #   Weight loader
-  engine_py.cpp           #   Python bindings (pybind11)
-  convert_weights.py      #   HF model -> Q4L weight format
-examples/                 # Training examples
-  countdown.py            #   Countdown numbers game (recommended for validation)
-  letter_counting.py      #   Letter counting (continuous reward signal)
-  gsm8k.py                #   GSM8K math (granular format + correctness rewards)
-  custom_reward.py        #   Custom reward function template
-benchmark/                # Speed comparison (vs TRL, vLLM)
-```
