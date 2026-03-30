@@ -17,24 +17,54 @@ Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretr
 ## Quick start
 
 ```python
-from train import grpo_train
-from datasets import Dataset
+from triebwerk import GRPOTrainer
 
 def my_reward(completions, answer, **kwargs):
     return [2.0 if ans in text else -1.0
             for text, ans in zip(completions, answer)]
 
-dataset = Dataset.from_list([
-    {"prompt": "What is 2+2?", "answer": "4"},
-    {"prompt": "Capital of France?", "answer": "Paris"},
-])
-
-grpo_train(
-    dataset=dataset,
-    reward_funcs=[my_reward],
+trainer = GRPOTrainer(
     model="Qwen/Qwen3-0.6B",
-    max_steps=300,
+    reward_funcs=[my_reward],
 )
+trainer.train(dataset, max_steps=300)
+```
+
+## Training algorithms
+
+```python
+from triebwerk import GRPOTrainer, DGTrainer
+
+# GRPO / DAPO (default) -- clipped surrogate with reference model
+trainer = GRPOTrainer(
+    model="Qwen/Qwen3-0.6B",
+    reward_funcs=[my_reward],
+    loss_type="dapo",  # or "grpo"
+)
+
+# Delightful Policy Gradient -- no reference model, simpler, one hyperparameter
+# Includes Kondo gate: auto-skips backward pass for low-value samples
+trainer = DGTrainer(
+    model="Qwen/Qwen3-0.6B",
+    reward_funcs=[my_reward],
+    eta=1.0,
+)
+```
+
+## Examples
+
+```bash
+# Countdown numbers game (recommended -- clearest learning signal for small models)
+PYTHONPATH=engine/build_local python3 examples/countdown.py --max-steps 300
+
+# Letter counting (continuous reward, good for debugging)
+PYTHONPATH=engine/build_local python3 examples/letter_counting.py --max-steps 300
+
+# GSM8K math (granular rewards: format + integer + correctness)
+PYTHONPATH=engine/build_local python3 examples/gsm8k.py --max-steps 300
+
+# Dry run (no C++ engine needed, uses HF generate)
+python3 examples/countdown.py --dry-run --max-steps 5
 ```
 
 ## What makes it fast
@@ -56,12 +86,12 @@ Training step:
   1. Triebwerk generates G completions (chunked prefill + CUDA graph decode, ~300 tok/s)
   2. Reward functions score completions (Python)
   3. PyTorch forward pass computes log-probs (batched, one call for all G)
-  4. GRPO loss: clipped surrogate with per-group advantage normalization
+  4. Loss: GRPO clipped surrogate or DG sigmoid gate
   5. PyTorch backward + optimizer step
   6. LoRA weights synced to engine via GPU-GPU memcpy (~0.02ms)
 ```
 
-## Running
+## Setup
 
 ```bash
 # Build the engine (one-time)
@@ -75,11 +105,8 @@ python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weight
 # Train
 PYTHONPATH=engine/build_local python3 train.py --max-steps 300
 
-# Quick test (3 steps)
-PYTHONPATH=engine/build_local python3 train.py --max-steps 3
-
-# Dry run (no C++ engine needed)
-python3 train.py --max-steps 5 --dry-run
+# Or use the Delightful PG algorithm (no reference model)
+PYTHONPATH=engine/build_local python3 train.py --max-steps 300 --loss-type dg
 ```
 
 ## TurboQuant: compressed KV cache
@@ -89,7 +116,7 @@ Compresses the KV cache using random rotation + optimal scalar quantization ([Za
 | Mode | KV bits | Memory reduction | Quality (0.6B) |
 |---|---|---|---|
 | `kv_bits=0` | 16 (fp16) | 1x (baseline) | Perfect |
-| `kv_bits=4` | 4 | **4x** | Good — coherent, slight accuracy loss |
+| `kv_bits=4` | 4 | **4x** | Good -- coherent, slight accuracy loss |
 | `kv_bits=2` | 2 | **8x** | Needs 8B+ models (too aggressive for 0.6B) |
 
 ### Max context length (Qwen3-0.6B, G=4 GRPO training)
@@ -100,20 +127,9 @@ Compresses the KV cache using random rotation + optimal scalar quantization ([Za
 | RTX 4060 8GB | ~7K tokens | ~24K tokens | 3.4x |
 | RTX 4090 24GB | ~20K tokens | ~65K tokens | 3.3x |
 
-### Usage
-
 ```bash
 # Enable 4-bit KV cache (recommended for Qwen3-0.6B)
 PYTHONPATH=engine/build_local python3 train.py --max-steps 300 --kv-bits 4
-
-# 2-bit for larger models (8B+)
-PYTHONPATH=engine/build_local python3 train.py --max-steps 300 --kv-bits 2
-```
-
-```python
-# Python API
-engine = jetson_engine.Engine(max_seq_len=8192, kv_bits=4)
-engine.load_weights("engine/weights_q4l")
 ```
 
 ## Supported models
@@ -135,7 +151,19 @@ All Qwen3 variants (runtime config, no recompilation):
 ## Repo structure
 
 ```
-train.py                  # GRPO trainer (no TRL dependency)
+triebwerk/                # Python package
+  trainers/
+    base.py               #   BaseTrainer (model loading, generation, training loop)
+    grpo.py               #   GRPOTrainer (GRPO/DAPO clipped surrogate)
+    dg.py                 #   DGTrainer (Delightful PG + Kondo gate)
+  engine.py               #   C++ engine wrapper
+  generation.py           #   generate_with_engine, generate_with_hf
+  rewards.py              #   Built-in reward helpers
+  utils.py                #   Advantages, batched log-probs
+  banner.py               #   ASCII startup banner + memory map
+  compat.py               #   Jetson AMP patches
+  lora_sync.py            #   LoRA weight sync (PyTorch <-> engine)
+train.py                  # CLI entry point
 engine/                   # C++/CUDA inference engine
   engine.cpp              #   Forward pass, CUDA graphs, generation loop
   kernels.cu              #   CUDA kernels (attention, RoPE, sampling, norms)
@@ -144,12 +172,10 @@ engine/                   # C++/CUDA inference engine
   weights.cpp             #   Weight loader
   engine_py.cpp           #   Python bindings (pybind11)
   convert_weights.py      #   HF model -> Q4L weight format
-benchmark/                # Speed comparison (vs TRL, vLLM)
 examples/                 # Training examples
   countdown.py            #   Countdown numbers game (recommended for validation)
   letter_counting.py      #   Letter counting (continuous reward signal)
   gsm8k.py                #   GSM8K math (granular format + correctness rewards)
   custom_reward.py        #   Custom reward function template
-lora_sync.py              # LoRA weight sync (PyTorch <-> engine)
-jetson_compat.py          # Jetson AMP/dtype patches
+benchmark/                # Speed comparison (vs TRL, vLLM)
 ```
