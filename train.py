@@ -374,6 +374,44 @@ def print_banner(args, run_id):
         gang = "Schnell"
 
     engine_mode = "C++ dp4a" if not args.dry_run else "HF generate"
+    kv_bits = getattr(args, 'kv_bits', 0)
+    kv_mode = "TurboQuant 2-bit" if kv_bits == 2 else "fp16"
+
+    # Estimate KV cache capacity
+    # Qwen3-0.6B: 28 layers, KV_DIM=1024 (8 heads * 128 head_dim)
+    num_layers = 28
+    kv_dim = 1024
+    G = args.num_generations
+    max_tokens = args.max_completion_tokens
+    prompt_est = 100  # typical prompt length
+
+    if kv_bits == 2:
+        # 2-bit: 0.25 bytes/value + norms overhead
+        kv_bytes_per_token_per_layer = G * (kv_dim * 2 * 0.25 + 16)  # ~16 bytes norms
+    else:
+        # fp16: 2 bytes/value, K+V
+        kv_bytes_per_token_per_layer = G * kv_dim * 2 * 2
+
+    total_context = prompt_est + max_tokens
+    kv_total_mb = total_context * num_layers * kv_bytes_per_token_per_layer / 1e6
+
+    # Estimate max context from available VRAM
+    if torch.cuda.is_available():
+        free_mem = torch.cuda.mem_get_info()[0]
+        # Reserve ~2GB for model + PyTorch + engine buffers
+        kv_budget = max(0, free_mem - 2e9)
+        max_context = int(kv_budget / (num_layers * kv_bytes_per_token_per_layer))
+        max_context = min(max_context, 32768)  # cap at 32k
+    else:
+        max_context = 1024
+
+    context_pct = min(100, total_context / max_context * 100) if max_context > 0 else 100
+    if context_pct > 90:
+        ctx_color = "\033[1;31m"  # red
+    elif context_pct > 70:
+        ctx_color = "\033[1;33m"  # yellow
+    else:
+        ctx_color = "\033[1;32m"  # green
 
     print("""
    \033[1;36m████████╗██████╗ ██╗███████╗██████╗ ██╗    ██╗███████╗██████╗ ██╗  ██╗\033[0m
@@ -393,7 +431,9 @@ def print_banner(args, run_id):
     print(f"   \033[1m Antrieb:\033[0m  {engine_mode}")
     print(f"   \033[1m Gang:\033[0m     {gang}")
     print(f"   \033[1m Modell:\033[0m   {args.model}")
-    print(f"   \033[1m Schritte:\033[0m {args.max_steps} (G={args.num_generations}, {args.max_completion_tokens} tok)")
+    print(f"   \033[1m KV-Cache:\033[0m {kv_mode} ({kv_total_mb:.0f} MB for {total_context} tok)")
+    print(f"   \033[1m Kontext:\033[0m  {ctx_color}{total_context}/{max_context} ({context_pct:.0f}%)\033[0m")
+    print(f"   \033[1m Schritte:\033[0m {args.max_steps} (G={G}, {max_tokens} tok)")
     print(f"   \033[1m Lauf:\033[0m     {run_id}")
     print(f"   \033[90m{'=' * w}\033[0m")
 
@@ -416,7 +456,7 @@ def train(args):
     if not args.dry_run:
         sys.path.insert(0, os.environ.get("ENGINE_BUILD", "engine/build2"))
         import jetson_engine
-        engine = jetson_engine.Engine(1024)
+        engine = jetson_engine.Engine(1024, kv_bits=getattr(args, 'kv_bits', 0))
         weights_path = os.environ.get("ENGINE_WEIGHTS", "engine/weights_q4l")
         print(f"\nLoading C++ engine weights from {weights_path}...")
         engine.load_weights(weights_path)
@@ -774,9 +814,11 @@ def main():
     parser.add_argument("--output-dir", default="./checkpoints_engine")
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--save-steps", type=int, default=100)
-    # Dry run (no C++ engine, uses HF generate)
+    # Engine options
     parser.add_argument("--dry-run", action="store_true",
                         help="Use HF generate instead of C++ engine (for testing)")
+    parser.add_argument("--kv-bits", type=int, default=0,
+                        help="KV cache quantization: 0=fp16, 2=TurboQuant 2-bit (8x compression)")
     args = parser.parse_args()
 
     if args.epsilon_high is None:
