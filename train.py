@@ -446,6 +446,80 @@ def print_banner(args, run_id):
     print(f"   \033[90m{'=' * w}\033[0m")
 
 
+def print_memory_map(engine=None, weights_path=None):
+    """Print ASCII VRAM breakdown after all initialization is complete."""
+    if not torch.cuda.is_available():
+        return
+
+    total_mem = torch.cuda.get_device_properties(0).total_memory
+    free_mem = torch.cuda.mem_get_info()[0]
+    used_mem = total_mem - free_mem
+    total_gb = total_mem / 1e9
+
+    # PyTorch tracks its own allocations; engine uses raw cudaMalloc (not tracked by PyTorch).
+    # Total used = PyTorch reserved + engine cudaMalloc + CUDA context overhead.
+    pt_reserved = torch.cuda.memory_reserved()
+
+    # Engine allocations (cudaMalloc, not visible to PyTorch)
+    engine_bytes = max(0, used_mem - pt_reserved)
+
+    # Break down engine: weights + fp16 cache + arena
+    weight_bytes = 0
+    cache_bytes = 0
+    if weights_path and os.path.exists(weights_path + ".bin"):
+        weight_bytes = os.path.getsize(weights_path + ".bin")
+    if engine and hasattr(engine, 'model_config'):
+        cfg = engine.model_config()
+        n_layers = cfg.get('num_layers', 28)
+        hidden = cfg.get('hidden_size', 1024)
+        inter = cfg.get('intermediate_size', 3072)
+        kv_dim = cfg.get('num_kv_heads', 8) * cfg.get('head_dim', 128)
+        per_layer = (hidden*hidden*2 + kv_dim*hidden*2 + inter*hidden*2 + hidden*inter) * 2
+        cache_bytes = n_layers * per_layer
+    arena_bytes = max(0, engine_bytes - weight_bytes - cache_bytes)
+
+    segments = [
+        ("Gewichte",   weight_bytes, "\033[36m"),   # cyan
+        ("FP16-Cache", cache_bytes,  "\033[34m"),   # blue
+        ("PyTorch",    pt_reserved,  "\033[33m"),   # yellow
+        ("Arena+KV",   arena_bytes,  "\033[35m"),   # magenta
+    ]
+    free_bytes = free_mem
+
+    # Render bar
+    bar_width = 40
+    bar = ""
+    legend = []
+    for name, nbytes, color in segments:
+        if nbytes <= 0:
+            continue
+        chars = max(1, round(nbytes / total_mem * bar_width))
+        bar += f"{color}{'█' * chars}\033[0m"
+        gb = nbytes / 1e9
+        legend.append(f"{color}██\033[0m {name} {gb:.1f}G")
+
+    free_chars = bar_width - len(bar.replace('\033[0m', '').replace('\033[36m', '').replace('\033[34m', '').replace('\033[33m', '').replace('\033[35m', ''))
+    # Simpler: count actual block chars
+    block_count = bar.count('█')
+    free_chars = max(0, bar_width - block_count)
+    bar += f"\033[90m{'░' * free_chars}\033[0m"
+    legend.append(f"\033[90m░░\033[0m Frei {free_bytes/1e9:.1f}G")
+
+    pct = used_mem / total_mem * 100
+    if pct > 90:
+        pct_color = "\033[1;31m"
+    elif pct > 70:
+        pct_color = "\033[1;33m"
+    else:
+        pct_color = "\033[1;32m"
+
+    print(f"\n   \033[1m Speicher:\033[0m [{bar}] {pct_color}{used_mem/1e9:.1f}/{total_gb:.1f} GB ({pct:.0f}%)\033[0m")
+    # Print legend in rows of 3
+    for i in range(0, len(legend), 3):
+        row = "  ".join(legend[i:i+3])
+        print(f"             {row}")
+
+
 # ── Training Loop ──
 
 def train(args):
@@ -536,6 +610,10 @@ def train(args):
             eos_token_id=dummy_prompt[0],
         )
         print(f"  Arena pre-allocated + CUDA graph captured")
+
+    # ── Memory map (after everything is allocated) ──
+    weights_path = os.environ.get("ENGINE_WEIGHTS", "engine/weights_q4l") if engine else None
+    print_memory_map(engine, weights_path)
 
     # ── Optimizer + scaler ──
     trainable_params = [p for p in model.parameters() if p.requires_grad]
