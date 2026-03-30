@@ -92,13 +92,16 @@ Training step:
   6. LoRA weights synced to engine via GPU-GPU memcpy (~0.02ms)
 ```
 
-## Setup
+## Setup (Desktop GPU)
 
 ```bash
-# Build the engine (one-time)
+# Install Python deps
+pip install torch transformers peft datasets bitsandbytes
+
+# Build the C++ engine (one-time)
 cd engine && mkdir -p build_local && cd build_local
-cmake .. -DCMAKE_CUDA_ARCHITECTURES=89  # 87 for Jetson, 89 for RTX 4060
-make -j$(nproc)
+cmake .. -DCMAKE_CUDA_ARCHITECTURES=89  # 89 for RTX 40xx, 86 for RTX 30xx
+make -j$(nproc) && cd ../..
 
 # Convert weights (one-time)
 python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
@@ -106,9 +109,40 @@ python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weight
 # Train
 PYTHONPATH=engine/build_local python3 train.py --max-steps 300
 
-# Or use the Delightful PG algorithm (no reference model)
-PYTHONPATH=engine/build_local python3 train.py --max-steps 300 --loss-type dg
+# Dry run (no engine build needed, uses HF generate)
+python3 train.py --max-steps 5 --dry-run
 ```
+
+## Setup (Jetson Orin)
+
+Jetson needs Docker because bitsandbytes requires a specific CUDA/ARM build:
+
+```bash
+# Build Docker image (one-time, ~15 min)
+docker build --network=host -t triebwerk .
+
+# Convert weights (one-time)
+docker run --runtime nvidia --network=host \
+  -v $(pwd):/workspace \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  triebwerk python3 engine/convert_weights.py \
+    --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
+
+# Build the C++ engine inside Docker (one-time)
+docker run --runtime nvidia -v $(pwd):/workspace triebwerk bash -c \
+  'cd engine && mkdir -p build_docker && cd build_docker && \
+   cmake .. -DCMAKE_CUDA_ARCHITECTURES=87 && make -j4'
+
+# Train
+docker run --runtime nvidia --network=host \
+  -v $(pwd):/workspace \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  triebwerk bash -c \
+  'ENGINE_BUILD=engine/build_docker PYTHONPATH=engine/build_docker \
+   python3 train.py --max-steps 300'
+```
+
+Jetson tips: disable the desktop GUI (`sudo systemctl set-default multi-user.target`) to free ~800MB RAM. Add swap (`sudo fallocate -l 16G /home/$USER/16GB.swap && sudo mkswap /home/$USER/16GB.swap && sudo swapon /home/$USER/16GB.swap`).
 
 ## TurboQuant: compressed KV cache
 
