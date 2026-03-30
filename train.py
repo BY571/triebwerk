@@ -230,17 +230,24 @@ def grpo_step(model, optimizer, scaler, samples, config):
             new_lp = new_lp.gather(1, targets.unsqueeze(1)).squeeze(1)
             new_comp_lp = new_lp[len(p_ids) - 1:]
 
-            ratio = torch.exp(new_comp_lp - old_lp)
-
-            if config.loss_type == "grpo":
+            if config.loss_type == "dg":
+                # Delightful Policy Gradient (Osband 2025)
+                # gate = sigmoid(advantage * surprisal / eta), no reference model needed
+                surprisal = -new_comp_lp.detach()
+                eta = getattr(config, 'dg_eta', 1.0)
+                delight = adv * surprisal
+                gate = torch.sigmoid(delight / eta)
+                per_token_loss = -(gate.detach() * adv * new_comp_lp)
+            elif config.loss_type == "grpo":
+                ratio = torch.exp(new_comp_lp - old_lp)
                 surr1 = ratio * adv
                 surr2 = torch.clamp(ratio, 1.0 - config.epsilon, 1.0 + config.epsilon_high) * adv
                 per_token_loss = -torch.min(surr1, surr2)
             else:  # dapo
+                ratio = torch.exp(new_comp_lp - old_lp)
                 clipped_ratio = torch.clamp(ratio, 1.0 - config.epsilon, 1.0 + config.epsilon_high)
                 per_token_loss = -clipped_ratio * adv
 
-            # This sample's contribution: sum of token losses / total tokens across ALL samples
             sample_loss = per_token_loss.sum() / total_tokens
 
         loss_val = sample_loss.item()
@@ -248,12 +255,7 @@ def grpo_step(model, optimizer, scaler, samples, config):
             scaler.scale(sample_loss).backward()
             total_loss_val += per_token_loss.sum().item()
 
-        del outputs, logits, new_lp, input_tensor, sample_loss
-        del ratio, per_token_loss, new_comp_lp
-        if config.loss_type == "grpo":
-            del surr1, surr2
-        else:
-            del clipped_ratio
+        del outputs, logits, new_lp, input_tensor, sample_loss, per_token_loss, new_comp_lp
 
     if getattr(config, 'empty_cache', False):
         torch.cuda.empty_cache()
@@ -709,9 +711,12 @@ def train(args):
         # 4. Compute advantages
         advantages = compute_advantages(rewards, args.num_generations)
 
-        # 5. Compute reference log-probs (batched: one forward pass for all G completions)
-        with torch.no_grad():
-            old_logprobs = compute_batch_token_logprobs(model, completions, device)
+        # 5. Compute reference log-probs (skip for DG -- it doesn't use them)
+        if args.loss_type != "dg":
+            with torch.no_grad():
+                old_logprobs = compute_batch_token_logprobs(model, completions, device)
+        else:
+            old_logprobs = [None] * len(completions)
 
         # 6. Build samples for the gradient step
         samples = []
@@ -867,6 +872,7 @@ def grpo_train(
         logging_steps=kwargs.get("logging_steps", 1),
         save_steps=kwargs.get("save_steps", 100),
         empty_cache=kwargs.get("empty_cache", is_integrated_gpu),
+        dg_eta=kwargs.get("dg_eta", 1.0),
     )
 
     # Inject dataset and reward_funcs so train() can use them
@@ -897,7 +903,9 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--epsilon", type=float, default=0.2)
     parser.add_argument("--epsilon-high", type=float, default=None)
-    parser.add_argument("--loss-type", choices=["grpo", "dapo"], default="dapo")
+    parser.add_argument("--loss-type", choices=["grpo", "dapo", "dg"], default="dapo")
+    parser.add_argument("--dg-eta", type=float, default=1.0,
+                        help="DG temperature (only used with --loss-type dg, default 1.0)")
     parser.add_argument("--mask-truncated", action="store_true", default=True)
     parser.add_argument("--no-mask-truncated", dest="mask_truncated", action="store_false")
     # Output
