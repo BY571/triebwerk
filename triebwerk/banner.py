@@ -80,7 +80,7 @@ def print_banner(args, run_id):
     w = 62
     print(f"   \033[90m{'=' * w}\033[0m")
     print(f"   \033[1m{'TRIEBWERK':^{w}}\033[0m")
-    print(f"   \033[90m{'High-Performance GRPO Training':^{w}}\033[0m")
+    print(f"   \033[90m{'High-Performance RL Training for LLMs':^{w}}\033[0m")
     print(f"   \033[90m{'-' * w}\033[0m")
     print(f"   \033[1m Version:\033[0m  {VERSION}")
     print(f"   \033[1m Device:\033[0m   {gpu_name}{gpu_mem}")

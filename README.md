@@ -24,7 +24,7 @@ Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretr
 
    ==============================================================
                             TRIEBWERK
-                   High-Performance GRPO Training
+              High-Performance RL Training for LLMs
    --------------------------------------------------------------
     Version:  0.1.0
     Device:   NVIDIA GeForce RTX 4060 Laptop GPU (8.2 GB)
