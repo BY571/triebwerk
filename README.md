@@ -182,19 +182,22 @@ Total unified memory:              7,990 MB
 PYTHONPATH=engine/build_local python3 train.py --max-steps 300 --kv-bits 4
 ```
 
-## Supported models
+## Supported models & hardware
 
-All Qwen3 variants (runtime config, no recompilation):
+The engine reads model dimensions from a JSON config at runtime, no recompilation needed. We're actively extending support to more models and GPUs.
 
-| Model | Validated | Notes |
+| Model | Status | VRAM |
 |---|---|---|
-| Qwen3-0.6B | Yes | Fits on 8GB |
-| Qwen3-1.7B | Config ready | Needs 16GB+ |
-| Qwen3-4B | Config ready | Needs 16GB+ |
-| Qwen3-8B | Config ready | Needs 24GB+ |
+| Qwen3-0.6B | Validated | 8GB+ |
+| Qwen3-1.7B | Config ready | 16GB+ |
+| Qwen3-4B | Config ready | 16GB+ |
+| Qwen3-8B | Config ready | 24GB+ |
 
-## Supported hardware
+| GPU | Status |
+|---|---|
+| RTX 4060 Laptop 8GB (sm_89) | Validated |
+| Jetson Orin Nano 8GB (sm_87) | Validated |
+| Any NVIDIA GPU sm_61+ (Pascal and later) | Target |
 
-- **Validated**: RTX 4060 Laptop 8GB (sm_89), Jetson Orin Nano 8GB (sm_87)
-- **Target**: Any NVIDIA GPU with sm_61+ (Pascal and later)
+Want to see a specific model or GPU supported? [Open an issue](https://github.com/BY571/triebwerk/issues).
 
