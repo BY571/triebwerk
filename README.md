@@ -59,14 +59,8 @@ RL fine-tuning engine for LLMs. C++/CUDA inference engine with CUDA graphs and 4
 ```bash
 git clone https://github.com/BY571/triebwerk && cd triebwerk
 uv sync
-
-# Build C++ engine (one-time)
-cd engine && mkdir -p build_local && cd build_local
-cmake .. -DCMAKE_CUDA_ARCHITECTURES=89  # 89 for RTX 40xx, 86 for RTX 30xx
-make -j$(nproc) && cd ../..
-
-# Convert weights (one-time)
-python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
+./build_engine.sh  # auto-detects your GPU architecture
+uv run python3 engine/convert_weights.py --model Qwen/Qwen3-0.6B --output engine/weights_q4l --mode q4l
 
 # Train
 PYTHONPATH=engine/build_local uv run python3 train.py --max-steps 300
