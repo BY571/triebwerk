@@ -1,19 +1,5 @@
 # Triebwerk
 
-Fast GRPO/RL fine-tuning engine for LLMs on any NVIDIA GPU. Matches vLLM speed on desktop GPUs and runs on edge devices like Jetson Orin where vLLM can't. Custom C++/CUDA inference engine with CUDA graphs, 4-bit quantization, and batched generation. PyTorch handles gradients, Triebwerk handles speed.
-
-## Performance
-
-| Setup | Device | Step time | tok/s |
-|---|---|---|---|
-| TRL + HF generate | RTX 4060 | 68.3s | ~15 |
-| TRL + HF generate | Jetson Orin 8GB | 130.6s | ~7 |
-| vLLM | RTX 4060 | 5.2s | ~375 |
-| **Triebwerk** | **RTX 4060** | **5.8s** | **~300** |
-| **Triebwerk** | **Jetson Orin 8GB** | **16.5s** | **~104** |
-
-Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretrained()`, deploy anywhere.
-
 ```
    ████████╗██████╗ ██╗███████╗██████╗ ██╗    ██╗███████╗██████╗ ██╗  ██╗
    ╚══██╔══╝██╔══██╗██║██╔════╝██╔══██╗██║    ██║██╔════╝██╔══██╗██║ ██╔╝
@@ -40,11 +26,32 @@ Output: standard HuggingFace PEFT LoRA adapters. Load with `PeftModel.from_pretr
              ██ Weights 0.6G  ██ FP16-Cache 0.8G  ██ PyTorch 1.4G
              ██ Arena+KV 0.5G  ░░ Free 5.0G
 
-   [1/300] loss=-0.67  reward=-0.88  tok/s=300  gen=5.2s  step=5.8s  [0m]
-   [2/300] loss=-0.42  reward= 0.25  tok/s=284  gen=3.9s  step=4.6s  [0m]
-   [3/300] loss=-0.50  reward=-0.62  tok/s=253  gen=5.2s  step=5.7s  [0m]
+   [1/300] loss=-0.67  reward=-0.88  tok/s=300  gen=5.2s  step=5.8s
+   [2/300] loss=-0.42  reward= 0.25  tok/s=284  gen=3.9s  step=4.6s
+   [3/300] loss=-0.50  reward=-0.62  tok/s=253  gen=5.2s  step=5.7s
    ...
 ```
+
+RL fine-tuning engine for LLMs. C++/CUDA inference engine with CUDA graphs and 4-bit quantization. Matches vLLM on desktop GPUs, runs on Jetson Orin where vLLM can't. Outputs standard HuggingFace PEFT LoRA adapters.
+
+## Algorithms
+
+| Algorithm | Paper | Description | Reference model |
+|---|---|---|---|
+| **GRPO** | [Shao et al. 2024](https://arxiv.org/abs/2402.03300) | Group Relative Policy Optimization with clipped surrogate | Yes |
+| **DAPO** | [Yu et al. 2025](https://arxiv.org/abs/2503.14476) | Dynamic sampling GRPO, asymmetric clipping | Yes |
+| **DG** | [Osband 2025](https://arxiv.org/abs/2603.14608) | Delightful Policy Gradient, sigmoid delight gate | No |
+| **Kondo** | [Osband 2025](https://arxiv.org/abs/2603.20526) | Skip backward for low-value samples (built into DG) | No |
+
+## Performance
+
+| Setup | Device | Step time | tok/s |
+|---|---|---|---|
+| TRL + HF generate | RTX 4060 | 68.3s | ~15 |
+| TRL + HF generate | Jetson Orin 8GB | 130.6s | ~7 |
+| vLLM | RTX 4060 | 5.2s | ~375 |
+| **Triebwerk** | **RTX 4060** | **5.8s** | **~300** |
+| **Triebwerk** | **Jetson Orin 8GB** | **16.5s** | **~104** |
 
 ## Quick start
 
