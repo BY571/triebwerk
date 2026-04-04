@@ -2364,8 +2364,8 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     // CUDA graph captures: decode_batch + sampling (with pointer indirection for randoms).
     // The graph reads *d_randoms_ptr which is updated via 8-byte cudaMemcpyAsync per step.
-    // CUDA graph not compatible with SSM layers (they use cudaMemset during decode)
-    if (!config_.is_hybrid() && G > 1 && max_new_tokens >= 50 && !(graph_G_ == G && decode_graph_exec_)) {
+    // SSM decode is graph-safe: all ops are kernel launches, no cudaMemset.
+    if (G > 1 && max_new_tokens >= 50 && !(graph_G_ == G && decode_graph_exec_)) {
         if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
         if (decode_graph_) { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
 
