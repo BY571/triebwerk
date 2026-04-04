@@ -1,5 +1,14 @@
 """Base trainer with shared logic for model loading, generation, and training loop."""
 
+# Block fla BEFORE any transformers import — fla's Triton CPU fallback
+# hijacks SSM computation and runs 100x slower than torch's GPU fallback
+import torch
+if torch.cuda.is_available() and torch.cuda.get_device_properties(0).is_integrated:
+    import sys as _sys
+    for _mod in ["fla", "fla.modules", "fla.ops", "fla.ops.gated_delta_rule",
+                  "fla.ops.delta_rule", "fla.utils"]:
+        _sys.modules[_mod] = None
+
 import argparse
 import json
 import math
@@ -9,11 +18,10 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 
-import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from triebwerk.compat import patch_amp_for_jetson, cast_model_to_fp16
+from triebwerk.compat import patch_amp_for_jetson, patch_fla_for_jetson, cast_model_to_fp16
 from triebwerk.banner import print_banner, print_memory_map
 from triebwerk.generation import generate_with_engine, generate_with_hf
 from triebwerk.rewards import format_reward, correctness_reward, get_gsm8k_dataset
@@ -81,7 +89,8 @@ class BaseTrainer(ABC):
         else:
             self.empty_cache = empty_cache
 
-        # Patch AMP for Jetson compatibility
+        # Jetson compatibility patches
+        patch_fla_for_jetson()  # block fla to prevent Triton CPU fallback for SSM
         patch_amp_for_jetson()
 
         # Will be set during train()
@@ -331,6 +340,8 @@ class BaseTrainer(ABC):
             # 1. Sync LoRA to engine
             if self.syncer is not None:
                 self.syncer.sync()
+            if step == 1:
+                print(f"  [timing] sync: {time.time()-t_step:.1f}s", flush=True)
 
             # 2. Generate G completions
             t_gen = time.time()
@@ -345,6 +356,9 @@ class BaseTrainer(ABC):
                     max_completion_tokens, self.temperature, self.top_p, stop_ids,
                 )
             t_gen = time.time() - t_gen
+
+            if step == 1:
+                print(f"  [timing] gen: {t_gen:.1f}s", flush=True)
 
             # 3. Decode and score
             comp_texts = [
@@ -361,6 +375,8 @@ class BaseTrainer(ABC):
             advantages = compute_advantages(rewards, num_generations)
 
             # 5. Compute reference log-probs (skip for trainers that don't need them)
+            if step == 1:
+                print(f"  [timing] rewards: {time.time()-t_step:.1f}s", flush=True)
             if self.needs_reference_logprobs:
                 with torch.no_grad():
                     old_logprobs = compute_batch_token_logprobs(
@@ -382,7 +398,11 @@ class BaseTrainer(ABC):
                 })
 
             # 7. Gradient step (subclass implements this)
+            if step == 1:
+                print(f"  [timing] ref_logprobs: {time.time()-t_step:.1f}s", flush=True)
             loss = self.compute_loss(self.model, self.optimizer, self.scaler, samples)
+            if step == 1:
+                print(f"  [timing] loss+backward: {time.time()-t_step:.1f}s", flush=True)
 
             # 8. Metrics
             total_tokens = sum(len(c["completion_ids"]) for c in completions)

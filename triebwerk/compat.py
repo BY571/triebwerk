@@ -27,6 +27,23 @@ def patch_amp_for_jetson():
     print("[jetson_compat] Patched AMP unscale for bf16 -> fp32")
 
 
+def patch_fla_for_jetson():
+    """Block fla import to force torch SSM fallback on Jetson.
+
+    fla (flash-linear-attention) requires Triton which doesn't support ARM.
+    When fla IS importable, it registers its chunk kernels but falls back to
+    CPU Python — 100x slower than the pure-torch GPU fallback in HF transformers.
+    Blocking fla forces HF to use torch_chunk_gated_delta_rule which runs on GPU.
+    """
+    import sys
+    if torch.cuda.is_available() and torch.cuda.get_device_properties(0).is_integrated:
+        # Jetson (integrated GPU, ARM) — block fla to prevent Triton CPU fallback
+        for mod in ["fla", "fla.modules", "fla.ops", "fla.ops.gated_delta_rule",
+                     "fla.ops.delta_rule", "fla.utils"]:
+            sys.modules[mod] = None
+        print("[jetson_compat] Blocked fla import (Triton not on ARM, using torch SSM fallback)")
+
+
 def cast_model_to_fp16(model):
     """Cast all bf16 parameters and buffers to fp16.
 
