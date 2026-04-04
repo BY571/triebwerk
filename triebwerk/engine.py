@@ -143,17 +143,37 @@ def share_bnb_weights(engine, model):
                 nf4_code_gpu = nf4_code
                 _refs.append(nf4_code_gpu)
 
-            # bnb packs NF4 as: byte = (elem0 << 4) | elem1 — same as engine's NF4.
-            # For dp4a, we need interleaved groups of 8:
-            #   byte[i] = elem[i%4] | (elem[i%4+4] << 4) within each group
-            # Repack: unpack nibbles → reorder → repack. No dequant, no accuracy loss.
+            # Unpack bnb NF4 nibbles to a flat array, optionally reorder rows,
+            # then repack into dp4a-interleaved format.
             raw = param.data.cpu().numpy().flatten()
             n_elem = out_dim * in_dim
 
             # Unpack: hi nibble = elem[2i], lo nibble = elem[2i+1]
             nibbles = np.empty(n_elem, dtype=np.uint8)
-            nibbles[0::2] = (raw >> 4) & 0x0F   # first element (hi nibble)
-            nibbles[1::2] = raw & 0x0F           # second element (lo nibble)
+            nibbles[0::2] = (raw >> 4) & 0x0F
+            nibbles[1::2] = raw & 0x0F
+
+            # Gated attention q_proj: reorder rows from interleaved to split layout
+            # bnb: [q_h0(hd), gate_h0(hd), q_h1(hd), gate_h1(hd), ...]
+            # engine: [q_h0, q_h1, ..., gate_h0, gate_h1, ...]
+            if eng_name == "q_proj" and hasattr(hf_config, "model_type") and \
+               "qwen3_5" in getattr(hf_config, "model_type", "").lower():
+                nh = hf_config.num_attention_heads
+                hd = out_dim // (nh * 2)  # head_dim
+                nib_2d = nibbles.reshape(out_dim, in_dim)
+                nib_4d = nib_2d.reshape(nh, 2, hd, in_dim)
+                query = nib_4d[:, 0, :, :].reshape(-1, in_dim)
+                gate = nib_4d[:, 1, :, :].reshape(-1, in_dim)
+                nibbles = np.concatenate([query, gate], axis=0).flatten()
+                # Also reorder absmax to match
+                bpr = in_dim // 64  # blocks per row
+                abs_2d = absmax_f32.reshape(out_dim, bpr)
+                abs_4d = abs_2d.reshape(nh, 2, hd, bpr)
+                abs_q = abs_4d[:, 0, :, :].reshape(-1, bpr)
+                abs_g = abs_4d[:, 1, :, :].reshape(-1, bpr)
+                absmax_f32 = np.concatenate([abs_q, abs_g], axis=0).flatten()
+                absmax_gpu = torch.from_numpy(absmax_f32).cuda()
+                _refs.append(absmax_gpu)
 
             # Repack into dp4a order: groups of 8
             grp = nibbles.reshape(-1, 8)

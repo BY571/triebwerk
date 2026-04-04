@@ -105,6 +105,7 @@ extern "C" {
     void launch_fp16_gemv(const half* weight, const half* input, half* output, int out_dim, int in_dim, cudaStream_t stream);
     void launch_nf4_gemv_fast(const uint8_t* packed, const float* absmax, const half* input, half* output, int out_dim, int in_dim, int block_size, cudaStream_t stream);
     void launch_nf4_dp4a_gemv(const uint8_t* w, const float* absmax, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
+    void launch_nf4_batch_gemv(const uint8_t* w, const float* absmax, const half* input, half* output, int out_dim, int in_dim, int G, cudaStream_t stream);
     void launch_nf4_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_q4l_fused_2(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const half* input, int in_dim, cudaStream_t stream);
     void launch_nf4_fused_3(const uint8_t* a_w, const float* a_abs, half* a_out, int a_dim, const uint8_t* b_w, const float* b_abs, half* b_out, int b_dim, const uint8_t* c_w, const float* c_abs, half* c_out, int c_dim, const half* input, int in_dim, cudaStream_t stream);
@@ -113,6 +114,7 @@ extern "C" {
     void launch_q4l_dp4a_gemv(const uint8_t* w, const float* w_scales, const int8_t* q8, const float* q8_sc, const float* q8_sm, half* y, int out_dim, int in_dim, cudaStream_t stream);
     void launch_dequant_q4l(half* out, const uint8_t* data, const float* scales, int out_dim, int in_dim, cudaStream_t stream);
     void launch_q4l_batch_gemm(const uint8_t* w, const float* w_scales, const half* input, half* output, int out_dim, int in_dim, int G, cudaStream_t stream);
+    void launch_nf4_batch_gemv(const uint8_t* w, const float* absmax, const half* input, half* output, int out_dim, int in_dim, int G, cudaStream_t stream);
 
     // Batched kernel launchers
     void launch_embed_batch(half* h, const half* et, const int* tok, int G, int hidden_size, cudaStream_t s);
@@ -1028,19 +1030,14 @@ void InferenceEngine::forward_layer(int layer_idx) {
 
     // 1. Input LayerNorm
     half* norm_out = state_.ffn_out;
-    if (!layer.input_layernorm) { fprintf(stderr, "[L%d] input_layernorm is NULL!\n", layer_idx); return; }
     launch_copy_rms_norm(state_.hidden, layer.input_layernorm,
                          state_.residual, norm_out,
                          HIDDEN_SIZE, RMS_NORM_EPS, stream);
-    cudaStreamSynchronize(stream);
-    { auto _e = cudaGetLastError(); if (_e != cudaSuccess) { fprintf(stderr, "[L%d] norm FAIL: %s\n", layer_idx, cudaGetErrorString(_e)); return; } }
 
     // Quantize input to int8 for dp4a
     if (weights_.is_q4l) {
         launch_quantize_input_q8(norm_out, state_.q8_data, state_.q8_scales,
                                  state_.q8_sums, HIDDEN_SIZE, stream);
-        cudaStreamSynchronize(stream);
-        { auto _e = cudaGetLastError(); if (_e != cudaSuccess) { fprintf(stderr, "[L%d] q8 FAIL: %s\n", layer_idx, cudaGetErrorString(_e)); return; } }
     }
 
     // 2. QKV projections
@@ -1050,15 +1047,7 @@ void InferenceEngine::forward_layer(int layer_idx) {
         FUSED3_4BIT(q, state_.q_buf, k, state_.k_buf, v, state_.v_buf, norm_out, q.in_dim, stream);
     } else {
         if (layer.q_proj_fp16) cublas_hgemv_lora(layer.q_proj_fp16, norm_out, state_.q_buf, Q_DIM, HIDDEN_SIZE, layer.lora_q, state_.lora_scratch);
-        else {
-            auto& w = layer.q_proj_nf4;
-            if (!w.data) { fprintf(stderr, "[L%d] q_proj_nf4.data is NULL!\n", layer_idx); return; }
-            fprintf(stderr, "[L%d] q_proj: data=%p absmax=%p qmap=%p od=%d id=%d bs=%d\n",
-                    layer_idx, (void*)w.data, (void*)w.absmax, (void*)w.quant_map, w.out_dim, w.in_dim, w.block_size);
-            GEMV_4BIT(w, norm_out, state_.q_buf, stream);
-        }
-        cudaStreamSynchronize(stream);
-        { auto _e = cudaGetLastError(); if (_e != cudaSuccess) { fprintf(stderr, "[L%d] q_proj FAIL: %s\n", layer_idx, cudaGetErrorString(_e)); return; } }
+        else { auto& w = layer.q_proj_nf4; GEMV_4BIT(w, norm_out, state_.q_buf, stream); }
         if (layer.k_proj_fp16) cublas_hgemv_lora(layer.k_proj_fp16, norm_out, state_.k_buf, KV_DIM, HIDDEN_SIZE, layer.lora_k, state_.lora_scratch);
         else { auto& w = layer.k_proj_nf4; GEMV_4BIT(w, norm_out, state_.k_buf, stream); }
         if (layer.v_proj_fp16) cublas_hgemv_lora(layer.v_proj_fp16, norm_out, state_.v_buf, KV_DIM, HIDDEN_SIZE, layer.lora_v, state_.lora_scratch);
@@ -1170,15 +1159,9 @@ void InferenceEngine::decode(int token_id) {
 
     // Embedding lookup
     launch_embedding(weights_.embed_tokens, token_id, state_.hidden, HIDDEN_SIZE, stream);
-    cudaStreamSynchronize(stream);
-    auto e1 = cudaGetLastError();
-    if (e1 != cudaSuccess) { fprintf(stderr, "[decode] embed FAIL: %s\n", cudaGetErrorString(e1)); return; }
 
     for (int i = 0; i < NUM_LAYERS; i++) {
         forward_layer(i);
-        cudaStreamSynchronize(stream);
-        auto e2 = cudaGetLastError();
-        if (e2 != cudaSuccess) { fprintf(stderr, "[decode] layer %d FAIL: %s\n", i, cudaGetErrorString(e2)); return; }
     }
 
     // Final LayerNorm
@@ -1508,7 +1491,7 @@ void InferenceEngine::alloc_batch(int G, int max_seq_len) {
         if (config_.layer_type[i] == LAYER_SSM) {
             batch_->ssm_state[i] = (float*)batch_arena_.alloc(
                 (size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim
-                * config_.ssm_v_head_dim * sizeof(float));
+                * config_.ssm_v_head_dim * sizeof(float));  // fp16 state
             batch_->ssm_conv_state[i] = (float*)batch_arena_.alloc(
                 (size_t)G * config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(float));
         } else if (kv_bits_ == 0) {
@@ -1640,7 +1623,7 @@ void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* 
         // Use pre-dequanted fp16 weights with cuBLAS tensor cores
         batch_gemm(out, w.fp16_cache, in, w.out_dim, N, w.in_dim, stream);
     } else if (N <= 8 && w.quant_map && batch_->q8_data) {
-        // NF4 format: N independent NF4 dp4a GEMVs (int8 dot products + NF4 lookup)
+        // NF4: per-sequence dp4a (slower but proven correct)
         for (int g = 0; g < N; g++) {
             const half* in_g = in + (size_t)g * w.in_dim;
             half* out_g = out + (size_t)g * w.out_dim;
@@ -1662,7 +1645,7 @@ void InferenceEngine::batch_gemm_q4l(half* out, const NF4Weight& w, const half* 
                                  out_g, w.out_dim, w.in_dim, stream);
         }
     } else if (w.quant_map && batch_->q8_data) {
-        // NF4 large batch (prefill): per-token NF4 dp4a GEMV
+        // NF4 large batch (prefill): per-token dp4a
         for (int g = 0; g < N; g++) {
             const half* in_g = in + (size_t)g * w.in_dim;
             half* out_g = out + (size_t)g * w.out_dim;
@@ -2206,7 +2189,7 @@ void InferenceEngine::prefill_chunked(int T, int G, cudaStream_t stream) {
             if (config_.layer_type[layer] == LAYER_SSM) {
                 // Broadcast SSM recurrent state
                 size_t state_per_seq = (size_t)config_.ssm_num_v_heads * config_.ssm_k_head_dim
-                                     * config_.ssm_v_head_dim * sizeof(float);
+                                     * config_.ssm_v_head_dim * sizeof(half);
                 size_t conv_per_seq = (size_t)config_.ssm_conv_dim() * (config_.ssm_conv_kernel - 1) * sizeof(float);
                 cudaMemcpyAsync((char*)B->ssm_state[layer] + g * state_per_seq,
                                 B->ssm_state[layer],
@@ -2294,7 +2277,7 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
             // Zero SSM state and conv state
             if (B->ssm_state[i]) {
                 size_t state_sz = (size_t)G * config_.ssm_num_v_heads * config_.ssm_k_head_dim
-                                * config_.ssm_v_head_dim * sizeof(float);
+                                * config_.ssm_v_head_dim * sizeof(half);
                 cudaMemset(B->ssm_state[i], 0, state_sz);
             }
             if (B->ssm_conv_state[i]) {
