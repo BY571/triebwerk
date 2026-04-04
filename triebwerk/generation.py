@@ -28,6 +28,8 @@ def generate_with_engine(engine, tokenizer, prompt, num_generations,
     prompt_ids = tokenizer(text).input_ids
     eos_id = tokenizer.eos_token_id
 
+
+
     # Batched generation: all G completions in parallel
     batch_results = engine.generate_batch(
         [prompt_ids] * num_generations,
@@ -37,6 +39,7 @@ def generate_with_engine(engine, tokenizer, prompt, num_generations,
         eos_token_id=eos_id,
         stop_token_ids=stop_ids,
     )
+
 
     completions = []
     for comp_ids in batch_results:

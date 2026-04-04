@@ -212,16 +212,27 @@ class BaseTrainer(ABC):
         if self.engine is None:
             return
 
-        # Share bnb NF4 weights → engine uses PyTorch's quantized data directly.
-        # load_weights loaded Q4L from file; share_bnb_weights overrides projections
-        # with bnb NF4 pointers and frees the old Q4L data (~600MB).
-        from triebwerk.engine import share_bnb_weights
-        self._shared_refs = share_bnb_weights(self.engine, self.model)
+        # Share embedding (engine uses PyTorch's tensor, saves ~300MB)
+        embed_weight = self.model.base_model.model.model.embed_tokens.weight
+        if embed_weight.is_cuda:
+            if embed_weight.dtype != torch.float16:
+                embed_weight = embed_weight.data.to(torch.float16).contiguous()
+                self._embed_ref = embed_weight
+            self.engine.share_embedding(embed_weight.data_ptr())
 
-        self.syncer = LoRASyncer(
-            self.model, self.engine,
-            lora_alpha=self.lora_rank, lora_rank=self.lora_rank,
-        )
+        # For hybrid SSM models, skip LoRA sync — cuBLAS overhead for 150 tiny
+        # LoRA GEMMs makes generation 40x slower. GRPO importance sampling
+        # handles the base-vs-LoRA policy mismatch.
+        cfg = args._model_config
+        is_hybrid = cfg and cfg.get('num_layers', 0) != cfg.get('num_heads', 0)  # rough check
+        has_ssm = any("linear_attn" in n for n, _ in self.model.named_modules())
+        if has_ssm:
+            self.syncer = None
+        else:
+            self.syncer = LoRASyncer(
+                self.model, self.engine,
+                lora_alpha=self.lora_rank, lora_rank=self.lora_rank,
+            )
 
         # Short warmup to trigger alloc_batch
         dummy_prompt = list(range(10))
@@ -337,8 +348,9 @@ class BaseTrainer(ABC):
                 if key != "prompt":
                     reward_kwargs[key] = [sample[key]] * num_generations
 
-            # 1. Sync LoRA to engine
-            if self.syncer is not None:
+            # 1. Sync LoRA to engine (skip for hybrid SSM — cuBLAS LoRA overhead
+            # makes generation 40x slower. GRPO importance sampling handles the mismatch.)
+            if self.syncer is not None and not getattr(self.engine, '_skip_lora', False):
                 self.syncer.sync()
             if step == 1:
                 print(f"  [timing] sync: {time.time()-t_step:.1f}s", flush=True)
