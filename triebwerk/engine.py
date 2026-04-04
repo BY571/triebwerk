@@ -54,7 +54,10 @@ def share_bnb_weights(engine, model):
 
     # Share embedding (engine frees its own copy)
     embed = base_model.embed_tokens.weight
-    if embed.dtype == torch.float16 and embed.is_cuda:
+    if embed.is_cuda:
+        if embed.dtype != torch.float16:
+            embed = embed.data.to(torch.float16).contiguous()
+            _refs.append(embed)
         engine.share_embedding(embed.data_ptr())
 
     nf4_code_gpu = None
