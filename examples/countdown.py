@@ -120,6 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--max-completion-tokens", type=int, default=512)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--top-p", type=float, default=0.9)
     args = parser.parse_args()
 
     trainer = GRPOTrainer(
@@ -127,6 +128,7 @@ if __name__ == "__main__":
         reward_funcs=[format_reward, equation_reward],
         loss_type="dapo",
         dry_run=args.dry_run,
+        top_p=args.top_p,
     )
     trainer.train(
         dataset=get_countdown(),

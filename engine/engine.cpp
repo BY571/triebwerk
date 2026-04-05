@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 
@@ -2312,8 +2313,13 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
                         cudaMemcpyHostToDevice, gen_stream);
 
         // Run chunked prefill (one forward pass, fills KV cache for all G seqs)
+        auto t_prefill_start = std::chrono::high_resolution_clock::now();
         prefill_chunked(max_prompt_len, G, gen_stream);
         cudaStreamSynchronize(gen_stream);
+        auto t_prefill_end = std::chrono::high_resolution_clock::now();
+        fprintf(stderr, "  Prefill: %ldms (%d tokens)\n",
+                std::chrono::duration_cast<std::chrono::milliseconds>(t_prefill_end - t_prefill_start).count(),
+                max_prompt_len);
 
         if (config_.is_hybrid()) {
             // For hybrid models: prefill already computed logits for the last token.
@@ -2473,6 +2479,7 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
 
     // Phase 2: Decode with amortized stop checking
     int last_checked = -1;
+    auto t_decode_start = std::chrono::high_resolution_clock::now();
     for (int step = first_step; step < max_new_tokens; step++) {
         if (use_graph) {
             // Update randoms indirection pointer (8 bytes, no sync needed)
@@ -2538,6 +2545,14 @@ std::vector<std::vector<int>> InferenceEngine::generate_batch(
         if (all_done) break;
     }
 
+    {
+        auto t_decode_end = std::chrono::high_resolution_clock::now();
+        auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_decode_end - t_decode_start).count();
+        int total_tok = 0;
+        for (auto& o : outputs) total_tok += o.size();
+        fprintf(stderr, "  Decode: %ldms (%d total tokens, %d steps)\n",
+                decode_ms, total_tok, max_new_tokens);
+    }
     // Collect any unchecked tokens (e.g., hybrid first_step=1 with max_new_tokens=1)
     if (first_step > 0 && last_checked < 0) {
         // Pre-loop tokens were stored but never checked/collected
