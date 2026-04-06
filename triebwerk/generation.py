@@ -4,11 +4,19 @@ import torch
 
 
 def _apply_template(tokenizer, prompt):
-    """Apply chat template for generation. No enable_thinking — let GRPO
-    teach the model to produce <think>...</think><answer>...</answer> from scratch."""
-    return tokenizer.apply_chat_template(
+    """Apply chat template. Model-agnostic.
+
+    Strips any pre-filled thinking tags from the generation prompt so the
+    model learns the full format via GRPO rewards, not from the template.
+    """
+    text = tokenizer.apply_chat_template(
         prompt, tokenize=False, add_generation_prompt=True,
     )
+    # Remove pre-filled empty thinking block injected by some templates
+    # e.g. Qwen3/3.5 default: "assistant\n<think>\n\n</think>\n\n"
+    # We want just: "assistant\n"
+    text = text.removesuffix("<think>\n\n</think>\n\n")
+    return text
 
 
 def generate_with_engine(engine, tokenizer, prompt, num_generations,
