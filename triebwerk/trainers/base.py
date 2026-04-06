@@ -347,6 +347,7 @@ class BaseTrainer(ABC):
 
             # 0. Wake engine if sleeping (re-allocates GPU buffers freed after last gen)
             if self.engine is not None and self.empty_cache:
+                torch.cuda.empty_cache()
                 self.engine.wake()
 
             # 1. Sync LoRA to engine (skip for hybrid SSM — cuBLAS LoRA overhead
